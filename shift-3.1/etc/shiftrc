@@ -1,0 +1,133 @@
+#
+# Skeleton configuration file for Shift manager.
+#
+# This file should be located in /etc/shiftrc for multi-user installs
+# and in ~/.shiftrc for single-user installs.
+#
+# Items that are commented out show the default value.
+#
+# A value of nodefault indicates no default value for that item.
+#
+# Items that are not commented out indicate values that must be
+# explicitly configured.  The values given for these items are
+# examples only.
+#
+
+#########################
+#### manager options ####
+#########################
+
+# directory where transfer metadata will be stored
+#   (use %u as substitution for user name)
+#   (parent dir must be world writable with sticky bit for multi-user installs)
+user_dir /var/lib/shift/%u
+
+# time (seconds) to store transfer metadata after last activity
+#data_expire 604800
+
+# location of file system information database
+#   (must be world readable for multi-user installs)
+#   (example: db_file /var/lib/shift/db)
+#db_file nodefault
+
+# log debugging information for user X in user_dir/X.debug
+#   (may be specified multiple times for different users)
+#   (example: debug_alice 1)
+#debug_X 1
+
+# domain to which user accounts belong for email notifications
+#   (assumes user X can receive email at X@email_domain)
+#   (assumes localhost:25 SMTP server running on manager host)
+#   (example: email_domain example.com)
+#email_domain nodefault
+
+# command to invoke to make host selection decisions
+#   (must be world readable/executable for multi-user installs)
+#   (example: select_hook /usr/local/bin/shift-select.hook)
+#select_hook nodefault
+
+# command to invoke to sync transfer metadata across multiple manager hosts
+#   (use %u as substitution for user_dir)
+#   (use %f as substitution for affected transfer metadata dir)
+#   (must be world readable/executable for multi-user installs)
+#   (example: sync_hook rsync -aR --append --no-implied-dirs %f host2:/)
+#sync_hook nodefault
+
+
+###########################
+#### transport options ####
+###########################
+
+# supported local transports by decreasing performance/preference
+#   (example: default_local mcp,rsync,default)
+#default_local default
+
+# supported remote transports by decreasing performance/preference
+#   (example: default_remote bbftp,rsync,fish,default)
+#default_remote default
+
+# supported encrypted transports by decreasing performance/preference
+#   (example: default_secure rsync,fish,default)
+#default_secure default
+
+# supported remote transports by decreasing small file performance/preference
+#   (example: default_small rsync,fish,bbftp,default)
+#default_small default
+ 
+
+########################
+#### tuning options ####
+########################
+
+# number of files to transfer in each batch
+#   (use suffix {k,m,b/g,t} for 10E{3,6,9,12})
+#default_files 1k
+
+# number of times to retry failed operations
+#   (must be at least 1 for --sync to function)
+#default_retry 2
+
+# approximate amount of data to transfer in each batch
+#   (use suffix {k,m,g,t} for {KB,MB,GB,TB})
+#default_size 4g
+
+# amount of data per lustre stripe
+#   (set to 0 to use default striping)
+#default_stripe 1g
+
+
+#################################
+#### parallelization options ####
+#################################
+
+# number of clients to spawn on each host
+#default_clients 1
+
+# maximum number of source hosts to involve in a transfer
+#default_hosts 1
+
+# amount of data at which single files will be parallelized
+#   (use suffix {k,m,g,t} for {KB,MB,GB,TB})
+#default_split 0
+
+
+############################
+#### throttling options ####
+############################
+
+# local average cpu usage (%) at which to throttle transfer
+#   (example: default_cpu 75)
+#default_cpu nodefault
+
+# target disk usage (%) at which to throttle transfer
+#   (example: default_disk 95)
+#default_disk nodefault
+
+# local average i/o usage (MB/s) at which to throttle transfer
+#   (example: default_io 1000)
+#default_io nodefault
+
+# local average network usage (MB/s) at which to throttle transfer
+#   (example: default_net 80)
+#default_net nodefault
+

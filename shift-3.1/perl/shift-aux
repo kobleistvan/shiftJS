@@ -1,0 +1,840 @@
+#!/usr/bin/perl -T
+#
+# Copyright (C) 2012-2014 United States Government as represented by the
+# Administrator of the National Aeronautics and Space Administration
+# (NASA).  All Rights Reserved.
+#
+# This software is distributed under the NASA Open Source Agreement
+# (NOSA), version 1.3.  The NOSA has been approved by the Open Source
+# Initiative.  See http://www.opensource.org/licenses/nasa1.3.php
+# for the complete NOSA document.
+#
+# THE SUBJECT SOFTWARE IS PROVIDED "AS IS" WITHOUT ANY WARRANTY OF ANY
+# KIND, EITHER EXPRESSED, IMPLIED, OR STATUTORY, INCLUDING, BUT NOT
+# LIMITED TO, ANY WARRANTY THAT THE SUBJECT SOFTWARE WILL CONFORM TO
+# SPECIFICATIONS, ANY IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR
+# A PARTICULAR PURPOSE, OR FREEDOM FROM INFRINGEMENT, ANY WARRANTY THAT
+# THE SUBJECT SOFTWARE WILL BE ERROR FREE, OR ANY WARRANTY THAT
+# DOCUMENTATION, IF PROVIDED, WILL CONFORM TO THE SUBJECT SOFTWARE. THIS
+# AGREEMENT DOES NOT, IN ANY MANNER, CONSTITUTE AN ENDORSEMENT BY
+# GOVERNMENT AGENCY OR ANY PRIOR RECIPIENT OF ANY RESULTS, RESULTING
+# DESIGNS, HARDWARE, SOFTWARE PRODUCTS OR ANY OTHER APPLICATIONS RESULTING
+# FROM USE OF THE SUBJECT SOFTWARE.  FURTHER, GOVERNMENT AGENCY DISCLAIMS
+# ALL WARRANTIES AND LIABILITIES REGARDING THIRD-PARTY SOFTWARE, IF
+# PRESENT IN THE ORIGINAL SOFTWARE, AND DISTRIBUTES IT "AS IS".
+#
+# RECIPIENT AGREES TO WAIVE ANY AND ALL CLAIMS AGAINST THE UNITED STATES
+# GOVERNMENT, ITS CONTRACTORS AND SUBCONTRACTORS, AS WELL AS ANY PRIOR
+# RECIPIENT.  IF RECIPIENT'S USE OF THE SUBJECT SOFTWARE RESULTS IN ANY
+# LIABILITIES, DEMANDS, DAMAGES, EXPENSES OR LOSSES ARISING FROM SUCH USE,
+# INCLUDING ANY DAMAGES FROM PRODUCTS BASED ON, OR RESULTING FROM,
+# RECIPIENT'S USE OF THE SUBJECT SOFTWARE, RECIPIENT SHALL INDEMNIFY AND
+# HOLD HARMLESS THE UNITED STATES GOVERNMENT, ITS CONTRACTORS AND
+# SUBCONTRACTORS, AS WELL AS ANY PRIOR RECIPIENT, TO THE EXTENT PERMITTED
+# BY LAW.  RECIPIENT'S SOLE REMEDY FOR ANY SUCH MATTER SHALL BE THE
+# IMMEDIATE, UNILATERAL TERMINATION OF THIS AGREEMENT.
+#
+
+# This program outputs various information based on the given command.
+# The 'find' command outputs the list of files and/or directories
+# beneath the given set of paths and corresponding stat information.
+# The 'fish' command initiates processing of FISH-like protocol commands.
+# The 'mount' command outputs the set of remotely mounted file systems.
+# The 'setfacl' command sets the acls of each given file as specified.
+# The 'setstripe' command sets the striping of each given file as specified.
+# The 'sum' command outputs whether or not the hashes computed for the
+# given list of files match the hashes given for each.
+
+require 5.006_001;
+use strict;
+use Cwd qw(abs_path);
+use Digest::MD5 qw(md5);
+use Fcntl qw(:DEFAULT :mode);
+use File::Basename;
+use File::Find qw();
+use File::Path;
+use Getopt::Long qw(:config bundling no_ignore_case require_order);
+use IO::File;
+use IPC::Open3;
+use List::Util qw(min);
+use Socket;
+use Sys::Hostname;
+
+our $VERSION = 0.82;
+
+# untaint path
+$ENV{PATH} = "/bin:/usr/bin:/usr/local/bin:/sbin:/usr/sbin:/usr/local/sbin";
+# untaint env
+delete $ENV{ENV};
+
+my %opts;
+my $cmd = shift @ARGV;
+
+# parse options and perform corresponding command
+if (!$cmd) {
+    die "Invalid command\n";
+} elsif ($cmd eq 'find') {
+    die "Invalid options\n" if (!GetOptions(\%opts,
+        "extract-tar", "dereference|L", "no-dereference|P",
+    ));
+    die "Invalid options\n" if (scalar(@ARGV) == 0);
+    find();
+} elsif ($cmd eq 'fish') {
+    die "Invalid options\n" if (scalar(@ARGV) > 0);
+    fish();
+} elsif ($cmd eq 'mount') {
+    die "Invalid options\n" if (scalar(@ARGV) > 0);
+    mount();
+} elsif ($cmd eq 'setfacl') {
+    die "Invalid options\n" if (scalar(@ARGV) > 0);
+    setfacl();
+} elsif ($cmd eq 'setstripe') {
+    die "Invalid options\n" if (scalar(@ARGV) > 0);
+    setstripe();
+} elsif ($cmd eq 'sum') {
+    %opts = (
+        'buffer-size' => 4,
+        'check-tree' => 0,
+        'hash-leaf-size' => 1024 * 1024,
+        'split-size' => 1024,
+    );
+    die "Invalid options\n" if (!GetOptions(\%opts,
+        "buffer-size=i", "c", "check-tree", "hash-leaf-size=i", "split-size=i",
+    ));
+    die "Invalid options\n" if (!$opts{c});
+    sum();
+}
+
+################
+#### escape ####
+################
+# return uri-escaped version of given string
+sub escape {
+    my $text = shift;
+    $text =~ s/([^A-Za-z0-9\-\._~\/])/sprintf("%%%02X", ord($1))/eg
+        if (defined $text);
+    return $text;
+}
+
+##################
+#### unescape ####
+##################
+# return uri-unescaped version of given string
+sub unescape {
+    my $text = shift;
+    $text =~ s/%([0-9A-Fa-f]{2})/chr(hex($1))/eg if (defined $text);
+    return $text;
+}
+
+##############
+#### find ####
+##############
+# output list of files/dirs beneath paths in @ARGV with stat info
+sub find {
+    if ($opts{'extract-tar'}) {
+        # try to dmget all tar files just in case
+        stderr_off();
+        if (open(DMGET, '|-', "dmget -q >/dev/null 2>/dev/null")) {
+            print DMGET join("\n", @ARGV);
+            close DMGET;
+        }
+        stderr_on();
+    }
+
+    # compute files and sizes
+    my $dmfh;
+    my %link;
+    $link{follow_fast} = 1 if ($opts{dereference});
+
+    foreach my $src (@ARGV) {
+        $src = unescape($src);
+        if ($opts{'extract-tar'}) {
+            find_tar(abs_path($src));
+            next;
+        }
+        # resolve src dir to absolute path but keep base name the same
+        my $dir = abs_path(dirname($src));
+        my $base = basename($src);
+        $dir .= "/" if ($dir !~ /\/$/);
+        # if trailing slash on dir link, then resolve top level
+        # even if --no-dereference is specified per posix spec
+        my $slash = $src =~ /.\/$/ ? 1 : 0;
+        $src = $dir . $base;
+        $slash = 0 if (! -l $src || ! -d $src);
+        $src .= "/" if ($slash);
+
+        # test whether source is on DMF file system
+        my $dmf;
+        stderr_off();
+        if (open(DMATTR, '-|', "dmattr", "-a", "state", $src)) {
+            my $state = <DMATTR>;
+            close DMATTR;
+            $dmf = 1 if ($state =~ /^[A-Z]{3}$/);
+            open($dmfh, '|-', "dmget -q >/dev/null 2>/dev/null")
+                if (!$dmfh && $dmf);
+        }
+        stderr_on();
+ 
+        File::Find::find({%link, no_chdir => 1, follow_skip => 2, wanted => sub {
+            my $file = $_;
+            # compute src
+            my $usrc;
+            if ($opts{dereference}) {
+                # resolve all symlinks
+                $usrc = $File::Find::fullname;
+                # fullname can be empty for some reason
+                $usrc = abs_path($file) if (!$usrc);
+            } elsif (-l $file && ($slash || ! -d $file &&
+                    !$opts{'no-dereference'}) && $File::Find::topdir eq $file) {
+                # resolve file symlinks by default
+                $usrc = abs_path($file);
+                # keep dangling links as is
+                $usrc = $file if (! -e $usrc);
+            } else {
+                # keep symlinks unresolved
+                $usrc = $file;
+            }
+
+            # always get stat info of real file
+            my @stat = -l $usrc ? lstat($usrc) : stat($usrc);
+            if (scalar(@stat) == 0) {
+                # escape commas
+                $file =~ s/(,)/sprintf("%%%02X", ord($1))/eg;
+                print "Cannot stat file $file\n";
+            } elsif (!S_ISDIR($stat[2]) && !S_ISREG($stat[2]) &&
+                    !S_ISLNK($stat[2])) {
+                # escape commas
+                $file =~ s/(,)/sprintf("%%%02X", ord($1))/eg;
+                print "Skipping unsupported file $file\n";
+            } else {
+                $stat[2] &= 07777;
+                # resolve uid/gid if possible
+                my $user = getpwuid($stat[4]);
+                my $group = getgrgid($stat[5]);
+                $user = "uid_$stat[4]" if (!$user);
+                $group = "gid_$stat[5]" if (!$group);
+
+                stderr_off();
+                # try to get acls
+                my @acls;
+                #TODO: other operating systems may use something different
+                open(FILE, '-|', "getfacl", "-cps", "--", $usrc);
+                while (<FILE>) {
+                    chomp;
+                    next if (!$_);
+                    push(@acls, escape($_));
+                }
+                close FILE;
+                push(@acls, "undef") if (scalar(@acls) == 0);
+
+                # try to get lustre striping
+                my @lattrs;
+                open(FILE, '-|', "lfs", "getstripe", "-d", $usrc);
+                while (<FILE>) {
+                    $lattrs[0] = $1 if (/stripe_count:\s*(-?\d+)/);
+                    $lattrs[1] = $1 if (/stripe_size:\s*(-?\d+)/);
+                }
+                close FILE;
+                $lattrs[0] = 0 if (!defined $lattrs[0] && defined $lattrs[1]);
+                $lattrs[1] = 0 if (!defined $lattrs[1] && defined $lattrs[0]);
+                push(@lattrs, "undef") if (scalar(@lattrs) == 0);
+                stderr_on();
+ 
+                print $dmfh $usrc, "\n" if ($dmf);
+
+                # print source path where file came from
+                print escape($src . (!$slash && -d $src ? "/" : "")), ",";
+
+                # print operation type
+                if (-l $usrc) {
+                    print "ln:", escape(readlink($usrc));
+                } elsif (-d $usrc) {
+                    print "mkdir";
+                } else {
+                    print "cp";
+                }
+                # print stat info separated by commas
+                print ",", join(",", escape($file), escape($usrc),
+                    @stat[7,2,4,5,8,9], escape($user), escape($group),
+                    join(";", @acls), join(";", @lattrs)), "\n";
+            }
+        }}, $src);
+    }
+    close $dmfh if ($dmfh);
+}
+
+##################
+#### find_tar ####
+##################
+# output list of files/dirs within files in @ARGV with stat info
+# based on Tar/Archive::Tar 0.07 by Calle Dybedahl (no license specified)
+sub find_tar {
+    my $tar = shift;
+    if (!open(TAR, $tar)) {
+        print "Invalid tar file\n";
+        return;
+    }
+    binmode TAR;
+    my %real;
+    my $head;
+    read(TAR, $head, 512);
+    while (length($head) == 512) {
+        # end of archive is two blocks of 512 but GNU tar uses one sometimes
+        return if ($head eq "\0" x 512);
+
+        # uid, gid, and size must be 'a' instead of 'A' for base-256 encoding
+        my @attrs = unpack('A100A8a8a8a12A12A8A1A100A6A2A32A32A8A8A155', $head);
+        # name mode uid gid size time sum type lnk mgc ver unam gnam dmj dmn pfx
+        #  0    1    2   3   4    5    6   7    8   9   10  11   12   13  14  15
+
+        # prepend prefix to name
+        if ($attrs[15]) {
+            $attrs[0] = $attrs[15] . "/" . $attrs[0];
+            $attrs[15] = "";
+        }
+        # remove last non-standalone slash
+        $attrs[0] =~ s/(?!^)\/$//;
+
+        if (!$attrs[0]) {
+            print "Empty file name in tar file\n";
+            last;
+        }
+        if ($attrs[9] ne 'ustar') {
+            print "Tar file not in supported ustar format\n";
+            last;
+        }
+
+        # convert octal numeric fields
+        $attrs[$_] = oct($attrs[$_]) foreach (1, 5, 6, 13, 14);
+
+        # handle GNU large uid/gid/size extension (two's-complement base-256)
+        foreach my $i (2..4) {
+            if (substr($attrs[$i], 0, 1) eq "\x80") {
+                my $val = ord(substr($attrs[$i], 1, 1)) & 0xff;
+                for (2..($i == 4 ? 11 : 7)) {
+                    $val <<= 8;
+                    $val |= (ord(substr($attrs[$i], $_, 1)) & 0xff);
+                }
+                $attrs[$i] = $val;
+            } else {
+                $attrs[$i] = oct $attrs[$i];
+            }
+        }
+
+        # validate checksum
+        substr($head, 148, 8) = "        ";
+        if (unpack("%16C*", $head) != $attrs[6]) {
+            print "Invalid tar header checksum\n";
+            last;
+        }
+
+        # handle GNU long names
+        if ($attrs[7] =~ /^[LK]$/) {
+            do {
+                # read next header
+                read(TAR, $head, 512);
+                # remove the extra byte used for \0
+                $head = substr($head, 0, $attrs[4] - 1) if ($attrs[4] < 512);
+                $real{$attrs[7]} .= $head;
+                $attrs[4] -= 512;
+            } while ($attrs[4] > 0);
+            # read next header
+            read(TAR, $head, 512);
+            next;
+        }
+
+        # find next header
+        my $offset = tell(TAR);
+        if (!seek(TAR, $attrs[4], 1)) {
+            print "Unable to seek in tar file\n";
+            last;
+        }
+        my $diff = $attrs[4] % 512;
+        # ignore padding
+        seek(TAR, 512 - $diff, 1) if ($diff != 0);
+
+        # read next header
+        read(TAR, $head, 512);
+
+        if ($real{L}) {
+            $attrs[0] = $real{L};
+            $real{L} = undef;
+        }
+        if ($real{K}) {
+            $attrs[8] = $real{K};
+            $real{K} = undef;
+        }
+
+        if ($attrs[7] eq '2') {
+            print "ln:", escape($attrs[8]);
+        } elsif ($attrs[7] eq '5') {
+            print "mkdir";
+        } elsif ($attrs[7] eq '0') {
+            print "cp";
+        } else {
+            # unsupported file type (e.g. pipes, devices, etc.)
+            next;
+        }
+        # print operation and stat info separated by commas
+        print ",", join(",", escape($attrs[0]), escape($tar),
+            @attrs[4,1,2,3,5,5], escape($attrs[11]), escape($attrs[12]),
+            $offset . "-" . ($offset + $attrs[4])), "\n";
+ 
+    }
+    close TAR;
+}
+
+##############
+#### fish ####
+##############
+# initiate fish protocol and perform each transfer given on STDIN
+sub fish {
+    $SIG{'CHLD'} = 'IGNORE';
+
+    my $in = \*STDIN;
+    my $out = \*STDOUT;
+    $out->autoflush(1);
+
+    # indicate running
+    $out->write("### 200\n");
+
+    while (defined($_ = $in->getline)) {
+        s/^\s+|\s+$//g;
+        next if (!s/^#//);
+        my @args = map {unescape($_)} split(/\s+/);
+        my $cmd = shift @args;
+        exit if ($cmd eq 'exit');
+        my $rc = fish_io($in, $out, $cmd, @args);
+    }
+}
+
+#################
+#### fish_io ####
+#################
+# perform given transfer and return result or return error message in hash
+sub fish_io {
+    my ($in, $out, $cmd, $src, $dst, $len, $off) = @_;
+    my ($err, $fh);
+    if ($cmd !~ /^(?:get|put)$/ || !$src || !$dst) {
+        $err = {error => "Invalid arguments"};
+    } else {
+        # untaint cmd as it taints other things via conditionals
+        $cmd = $1 if ($cmd =~ /(.*)/);
+        my $file = $cmd eq 'get' ? $src : $dst;
+        # untaint file
+        $file = $1 if ($file =~ /(.*)/);
+        $len = (stat $file)[7] if (!defined $len && $cmd eq 'get');
+
+        # create implicit directories
+        eval {mkpath(dirname($file))} if ($cmd eq 'put');
+
+        my $flags = $cmd eq 'get' ? O_RDONLY : O_WRONLY | O_CREAT;
+        $flags |= O_TRUNC if (!defined $off && $cmd eq 'put');
+        $fh = IO::File->new($file, $flags);
+        if (!defined $fh) {
+            $err = {error => "Error opening: $!"};
+        } elsif (defined $off && !$fh->seek($off, 0)) {
+            $fh->close;
+            $err = {error => "Error seeking: $!"};
+        }
+    }
+    if ($err) {
+        $out->write("### 500 $err->{error}\n");
+    } else {
+        $out->write("$len\n") if ($cmd eq 'get');
+        $out->write("### 100\n");
+    }
+    my $rc = fish_return($in);
+    return (ref $err ? $err : $rc) if (ref $err || ref $rc);
+    $len = $rc if ($cmd eq 'put');
+    $rc = undef;
+
+    my $size = 4 * 1048576;
+    while ($len > 0) {
+        $size = $len if ($len < $size);
+        if ($cmd eq 'put') {
+            $rc = fish_return($in);
+            if (ref $rc) {
+                $fh->close;
+                return $rc;
+            }
+        }
+        my $buf;
+        my $n = $cmd eq 'put' ?
+            $in->read($buf, $size) : $fh->sysread($buf, $size);
+        last if ($n < $size);
+        $out->write("### 200\n") if ($cmd eq 'get');
+        $cmd eq 'put' ? $fh->syswrite($buf) : $out->write($buf);
+        $len -= $n;
+    }
+    $fh->close;
+
+    if ($len > 0) {
+        $rc = {error => "Error reading: $!"};
+        $out->write("### 500 $rc->{error}\n");
+        fish_return($in);
+    } else {
+        $out->write("### 200\n");
+        $rc = fish_return($in);
+    }
+    return $rc;
+}
+
+#####################
+#### fish_return ####
+#####################
+# parse fish return values and return text or return error message in hash
+sub fish_return {
+    my $in = shift;
+    my $text;
+    while (defined($_ = $in->getline)) {
+        if (/^###\s+(\d+)(.*)/) {
+            if ($1 != 200 && $1 != 100) {
+                return {error => $2};
+            } else {
+                $text =~ s/\s+$//;
+                return $text;
+            }
+        } else {
+            $text .= $_;
+        }
+    }
+    return {error => "Invalid protocol return"};
+}
+
+##############
+#### fqdn ####
+##############
+# return fully qualified version of given host name
+sub fqdn {
+    my $host = shift;
+    if ($host =~ /^\d+\.\d+\.\d+\.\d+$/) {
+        my $name = gethostbyaddr(inet_aton($host), AF_INET);
+        return $name if ($name);
+    } else {
+        my @cols = gethostbyname($host);
+        return $cols[0] if ($cols[0]);
+    }
+    return $host;
+}
+
+##############
+#### hash ####
+##############
+# return hex hash of given file between given start and stop
+sub hash {
+    my ($file, $start, $stop) = @_;
+    my ($hash, $fh);
+    # compute number of splits
+    $opts{'nsplits'} = int(($stop - $start) / $opts{'split-size'}) + 1;
+    if (open($fh, '<', $file)) {
+        if ($start == $stop) {
+            # compute empty hex hash
+            $hash .= unpack("H*", md5(""));
+        } elsif ($opts{'check-tree'}) {
+            # compute concatenated list of hex hashes for each split
+            foreach my $split (0..$opts{'nsplits'} - 1) {
+                my $x1 = $start + $split * $opts{'split-size'};
+                my $x2 = $start + ($split + 1) * $opts{'split-size'};
+                $x2 = $stop if ($x2 > $stop);
+                my $tree = hash_tree($fh, $x1, $x2);
+                $hash .= unpack("H*", $tree);
+            }
+        } else {
+            # compute standard hex hash
+            my $tree = hash_tree($fh, $start, $stop);
+            $hash .= unpack("H*", $tree);
+        }
+        close $fh;
+    }
+    return $hash;
+}
+
+###################
+#### hash_tree ####
+###################
+# return binary hash of given file handle between given start and stop
+sub hash_tree {
+    my ($fh, $start, $stop) = @_;
+    if ($stop - $start == 0) {
+        return "";
+    } elsif ($opts{'nsplits'} == 1 ||
+            $stop - $start <= $opts{'hash-leaf-size'}) {
+        # single split so compute standard hash
+        sysseek($fh, $start, 0);
+        my $md5 = Digest::MD5->new;
+        my $buf;
+        my $total = 0;
+        while ($total < $stop - $start) {
+            # read data into buffer
+            my $n = sysread($fh, $buf,
+                min($opts{'buffer-size'}, $stop - $start - $total));
+            last if (!$n);
+            # add data to hash
+            $md5->add($buf);
+            $total += $n;
+        }
+        # return final hash
+        return $md5->digest;
+    } else {
+        # multiple splits so compute hash tree
+        my $leafs = ($stop - $start) / $opts{'hash-leaf-size'};
+        # compute midpoint that is power of 2
+        my $n = 1;
+        $n <<= 1 while ($n < $leafs);
+        $n >>= 1;
+        my $mid = $start + $n * $opts{'hash-leaf-size'};
+        # recursively compute left subtree hash
+        my $left = hash_tree($fh, $start, $mid);
+        # recursively compute right subtree hash
+        my $right = hash_tree($fh, $mid, $stop);
+        # return just left subhash if right subhash is empty
+        return $left if (!$right);
+        # return hash of left subhash concatenated with right subhash
+        return md5($left, $right);
+    }
+}
+
+###############
+#### mount ####
+###############
+# output the set of remotely mounted file systems
+sub mount {
+    my $host = fqdn(hostname);
+    my %mnt;
+    $mnt{host} = $host;
+    $mnt{args} = "mount";
+
+    # gather file system information from mount
+    open(FILE, '-|', "mount 2>/dev/null");
+    while (<FILE>) {
+        $mnt{opts} = /[\(,]ro[\),]/ ? "ro" : "rw";
+        $mnt{opts} .= ",dmi" if (/[\(,]dmi[\),]/);
+        #TODO: need to escape local and remote?
+        (my $dev, $mnt{local}, $mnt{type}) = ($1, $2, $3)
+            if (/(\S+)\s+on\s+(\S+)\s+type\s+(\S+)/);
+        if ($mnt{local}) {
+            # try to avoid NFS hangs by resolving dir but not base
+            my ($base, $dir) = fileparse($mnt{local});
+            $dir = abs_path($dir);
+            $dir =~ s/\/$//;
+            $mnt{local} = "$dir/$base";
+        }
+        if (/server_list=\(([^\)]+)\)/) {
+            # cxfs appears as xfs but with server_list set
+            $mnt{servers} = join(",", map {$_ = fqdn($_)} split(/,/, $1));
+            $mnt{type} = "cxfs";
+            $mnt{remote} = $mnt{local};
+        } elsif (/^(\S+):(\S+)/) {
+            # typical form for nfs
+            $mnt{remote} = $2;
+            $mnt{servers} = $1;
+            $mnt{servers} =~ s/@.*//;
+            $mnt{servers} = fqdn($mnt{servers});
+        } elsif ($mnt{type} eq 'gpfs') {
+            # gpfs servers do not appear in mount output so call mmlsmgr
+            my $srv = qx(mmlsmgr $dev);
+            # try a default location if not in path
+            $srv = qx(/usr/lpp/mmfs/bin/mmlsmgr $dev) if (!$srv);
+            next if (!defined $srv);
+            # output is file system then server ip address
+            if ($srv =~ /^(\w+)\s+(\d+\.\d+\.\d+\.\d+)/m) {
+                $mnt{remote} = "/$1";
+                $mnt{servers} = fqdn($2);
+            }
+        } elsif ($mnt{opts} =~ /,dmi/) {
+            # always report dmi file systems even if local
+            $mnt{servers} = $mnt{host};
+            $mnt{remote} = $mnt{local};
+        } else {
+            # ignore local file systems
+            next;
+        }
+        # print hash in single line with space-separated key=val form
+        print join(" ", map {"$_=$mnt{$_}"} sort(keys(%mnt))), "\n";
+    }
+    close FILE;
+
+    # check if host under PBS control
+    my $pbs;
+    open(FILE, '-|', "ps -uroot -ocommand 2>/dev/null");
+    while (<FILE>) {
+        if (/(?:^|\/)pbs_mom(?:\s|$)/) {
+            $pbs = 1;
+            last;
+        }
+    }
+    close FILE;
+
+    # indicate that system is accessible
+    print "args=shell host=$host", ($pbs ? " pbs=1" : ""), "\n";
+} 
+
+#################
+#### setfacl ####
+#################
+# set acls of each file given on STDIN to given value and output ok/error
+sub setfacl {
+    while (my $line = <STDIN>) {
+        chomp $line;
+        my ($file, $acls) = split(/\s+/, $line);
+        # untaint arguments
+        $file = $1 if ($file =~ /(.*)/);
+        $acls = $1 if ($acls =~ /(.*)/);
+        my $ufile = unescape($file);
+        my $uacls = unescape($acls);
+        $uacls =~ s/,/\n/g;
+        my ($in, $out);
+        #TODO: other operating systems may use something different
+        my $pid = open3($in, $out, $out, "setfacl", "-M-", $ufile);
+        print $in $uacls;
+        close $in;
+        waitpid($pid, 0);
+        if ($?) {
+            my $text;
+            $text .= $_ while (<$out>);
+            $text =~ s/\n/ /g;
+            print "$file,", escape($text), "\n";
+        } else {
+            print "$file,ok\n";
+        }
+        close $out;
+    }
+}
+
+###################
+#### setstripe ####
+###################
+# set striping of each file given on STDIN to given value and output ok/error
+sub setstripe {
+    while (my $line = <STDIN>) {
+        chomp $line;
+        my ($file, $count, $size) = split(/\s+/, $line);
+        # untaint arguments
+        $file = $1 if ($file =~ /(.*)/);
+        $count = $1 if ($count =~ /(\d+)/);
+        $size = $1 if ($size =~ /(\d+)/);
+        my $ufile = unescape($file);
+        $count = 0 if (!$count);
+        $count = -1 if ($count > 160);
+        $size = 0 if (!$size);
+        my $dir = $file =~ s/\/$// ? $file : dirname($file);
+        eval {mkpath($dir)};
+        my ($in, $out);
+        my $pid = open3($in, $out, $out, "lfs", "setstripe",
+            "-c", $count, "-s", $size, $ufile);
+        close $in;
+        waitpid($pid, 0);
+        if ($?) {
+            my $text;
+            $text .= $_ while (<$out>);
+            $text =~ s/\n/ /g;
+            print "$file,", escape($text), "\n";
+        } else {
+            print "$file,ok\n";
+        }
+        close $out;
+    }
+}
+
+####################
+#### stderr_off ####
+####################
+# save stderr and redirect to /dev/null
+my @stderrs;
+sub stderr_off {
+    my $fh;
+    open($fh, '>&', \*STDERR);
+    push(@stderrs, $fh);
+    open(STDERR, ">/dev/null");
+}
+
+###################
+#### stderr_on ####
+###################
+# restore stderr from saved copy
+sub stderr_on {
+    my $fh = pop @stderrs;
+    return if (!$fh);
+    open(STDERR, '>&', $fh);
+    close $fh;
+}
+
+#############
+#### sum ####
+#############
+# output whether or not the hash given on STDIN matches the hash
+# computed for the file given on STDIN
+sub sum {
+    # adjust sizes to powers of 2
+    foreach my $key (qw(buffer-size hash-leaf-size split-size)) {
+        $opts{$key} = 1 if ($opts{$key} < 0);
+        my $tmp = $opts{$key};
+        my $new = 1;
+        $new <<= 1 while ($tmp >>= 1);
+        $opts{$key} = $new;
+    }
+
+    # scale sizes appropriately
+    $opts{'buffer-size'} <<= 20;
+    $opts{'hash-leaf-size'} <<= 10;
+    $opts{'split-size'} <<= 20;
+    $opts{'split-size'} = $opts{'buffer-size'}
+        if ($opts{'split-size'} < $opts{'buffer-size'});
+    $opts{'hash-leaf-size'} = $opts{'split-size'}
+        if ($opts{'hash-leaf-size'} > $opts{'split-size'});
+
+    # check hashes
+    while (my $line = <STDIN>) {
+        chomp $line;
+        my ($start, $stop, $partial);
+        if ($line =~ /^#mutil#(\d+)-(\d+)/) {
+            # hash specific file subset
+            $start = $1;
+            $stop = $2;
+            $partial = 1;
+        }
+        $line =~ s/^#mutil#[^#]*#//;
+        # ignore comment lines that do not contain mutil
+        next if ($line =~ /^#/);
+        if ($line =~ /^(\S+)\s.(.*)/) {
+            # lines contain a hex hash then two chars then file path
+            my ($hash0, $file) = ($1, $2);
+            # unescape according to md5sum input rules
+            $file =~ s/\\([\\n])/$1 eq "n" ? "\n" : "\\"/eg
+                if ($hash0 =~ s/^\\//);
+            # use file start if no start given
+            $start = 0 if (!defined $start);
+            # use file end if no end given
+            $stop = (stat($file))[7] if (!defined $stop);
+            # compute hash of selected portion of file
+            my $hash = hash($file, $start, $stop);
+            print "$file: ";
+            if ($hash eq $hash0) {
+                # computed hash matches given hash
+                print "OK";
+                print ",$start-$stop" if ($partial);
+            } else {
+                # computed hash differs from given hash
+                print "FAILED";
+                if ($opts{'check-tree'} && defined $stop) {
+                    my $nsplits = int(($stop - $start) / $opts{'split-size'});
+                    # output which splits of file differed
+                    foreach my $i (0..$nsplits) {
+                        if (substr($hash, $i * 32, 32) ne
+                                substr($hash0, $i * 32, 32)) {
+                            my $end = $start + ($i + 1) * $opts{'split-size'};
+                            $end = $stop if ($end > $stop);
+                            print ",", $start + $i * $opts{'split-size'}, "-", $end;
+                        }
+                    }
+                } elsif ($partial) {
+                    # output portion of file that differed
+                    print ",$start-$stop";
+                }
+            }
+            print "\n";
+        }
+    }
+}
+

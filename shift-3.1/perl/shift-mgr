@@ -1,0 +1,3402 @@
+#!/usr/bin/perl -T
+#
+# Copyright (C) 2012-2014 United States Government as represented by the
+# Administrator of the National Aeronautics and Space Administration
+# (NASA).  All Rights Reserved.
+#
+# This software is distributed under the NASA Open Source Agreement
+# (NOSA), version 1.3.  The NOSA has been approved by the Open Source
+# Initiative.  See http://www.opensource.org/licenses/nasa1.3.php
+# for the complete NOSA document.
+#
+# THE SUBJECT SOFTWARE IS PROVIDED "AS IS" WITHOUT ANY WARRANTY OF ANY
+# KIND, EITHER EXPRESSED, IMPLIED, OR STATUTORY, INCLUDING, BUT NOT
+# LIMITED TO, ANY WARRANTY THAT THE SUBJECT SOFTWARE WILL CONFORM TO
+# SPECIFICATIONS, ANY IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR
+# A PARTICULAR PURPOSE, OR FREEDOM FROM INFRINGEMENT, ANY WARRANTY THAT
+# THE SUBJECT SOFTWARE WILL BE ERROR FREE, OR ANY WARRANTY THAT
+# DOCUMENTATION, IF PROVIDED, WILL CONFORM TO THE SUBJECT SOFTWARE. THIS
+# AGREEMENT DOES NOT, IN ANY MANNER, CONSTITUTE AN ENDORSEMENT BY
+# GOVERNMENT AGENCY OR ANY PRIOR RECIPIENT OF ANY RESULTS, RESULTING
+# DESIGNS, HARDWARE, SOFTWARE PRODUCTS OR ANY OTHER APPLICATIONS RESULTING
+# FROM USE OF THE SUBJECT SOFTWARE.  FURTHER, GOVERNMENT AGENCY DISCLAIMS
+# ALL WARRANTIES AND LIABILITIES REGARDING THIRD-PARTY SOFTWARE, IF
+# PRESENT IN THE ORIGINAL SOFTWARE, AND DISTRIBUTES IT "AS IS".
+#
+# RECIPIENT AGREES TO WAIVE ANY AND ALL CLAIMS AGAINST THE UNITED STATES
+# GOVERNMENT, ITS CONTRACTORS AND SUBCONTRACTORS, AS WELL AS ANY PRIOR
+# RECIPIENT.  IF RECIPIENT'S USE OF THE SUBJECT SOFTWARE RESULTS IN ANY
+# LIABILITIES, DEMANDS, DAMAGES, EXPENSES OR LOSSES ARISING FROM SUCH USE,
+# INCLUDING ANY DAMAGES FROM PRODUCTS BASED ON, OR RESULTING FROM,
+# RECIPIENT'S USE OF THE SUBJECT SOFTWARE, RECIPIENT SHALL INDEMNIFY AND
+# HOLD HARMLESS THE UNITED STATES GOVERNMENT, ITS CONTRACTORS AND
+# SUBCONTRACTORS, AS WELL AS ANY PRIOR RECIPIENT, TO THE EXTENT PERMITTED
+# BY LAW.  RECIPIENT'S SOLE REMEDY FOR ANY SUCH MATTER SHALL BE THE
+# IMMEDIATE, UNILATERAL TERMINATION OF THIS AGREEMENT.
+#
+
+# This program coordinates the tracking of file operations that are
+# performed as part of a user-initiated transfer.  It provides a way for
+# the Shift/Mesh client to add operations, set their state, and retrieve
+# operations for processing.  It also provides various status output to
+# the user upon request.
+
+use strict;
+use Compress::Zlib;
+use Fcntl qw(:flock);
+use File::Basename;
+use File::Path;
+use File::Temp qw(tempfile);
+use Getopt::Long qw(:config bundling no_ignore_case require_order);
+use IO::File;
+use List::Util qw(max min sum);
+use Math::BigInt;
+use MIME::Base64;
+use Net::Ping;
+use POSIX qw(ceil setsid setuid strftime);
+use Storable qw(dclone nfreeze nstore retrieve thaw);
+
+our $VERSION = 0.821;
+
+# byte string conversions
+my %bytes = (
+    '' => 1,
+    K => 1E3,
+    M => 1E6,
+    G => 1E9,
+    T => 1E12,
+    P => 1E15,
+    E => 1E18,
+);
+
+# second string conversions
+my %seconds = (
+    s => 1,
+    m => 60,
+    h => 60 * 60,
+    d => 24 * 60 * 60,
+    w => 7 * 24 * 60 * 60,
+);
+
+# define default defaults
+my %conf = (
+    data_expire => 604800,
+    default_clients => 1,
+    default_files => "1k",
+    default_hosts => 1,
+    default_local => "default",
+    default_remote => "default",
+    default_retry => 2,
+    default_secure => "default",
+    default_small => "default",
+    default_size => "4g",
+    default_split => 0,
+    default_stripe => "1g",
+);
+
+my %db;
+my $dbgfh;
+my $localtime = localtime;
+my $lockfh;
+my %meta;
+my $time = time;
+my %udb;
+
+# untaint path
+$ENV{PATH} = "/bin:/usr/bin:/usr/local/bin";
+# untaint env
+delete $ENV{ENV};
+
+# unlock files at program termination
+END {
+    close $dbgfh if (defined $dbgfh);
+    close $lockfh if (defined $lockfh);
+}
+
+# parse options
+my %opts;
+my $rc = GetOptions(\%opts,
+    "alive", "get", "history", "host=s", "id=s", "lock", "meta:1", "mounts",
+    "pid=i", "put", "restart", "search=s", "shift-mgr", "state=s", "stats",
+    "status:s", "stop", "user=s",
+);
+die "Invalid options\n" if (!$rc || scalar(@ARGV) != 0);
+
+# parse configuration
+foreach my $file ("/etc/shiftrc", (getpwuid($<))[7] . "/.shiftrc") {
+    open(FILE, '<', $file) or next;
+    my $mline;
+    while (my $line = <FILE>) {
+        # strip whitespace and comments
+        $line =~ s/^\s+|\s+$|\s*#.*//g;
+        next if (!$line);
+        # support line continuation operator
+        $mline .= $line;
+        next if ($mline =~ s/\s*\\$/ /);
+        if ($mline =~ /^(\S+)\s+(.*)/) {
+            $conf{$1} = $2;
+        }
+        $mline = undef;
+    }
+    close FILE;
+}
+die "The user_dir setting must be configured\n" if (!$conf{user_dir});
+
+# process --stats immediately before setuid or $conf{user_dir} changes
+if ($opts{stats}) {
+    stats();
+    exit;
+}
+
+if (defined $opts{user}) {
+    die "Only root can specify user\n" if ($> != 0);
+    # untaint user
+    $opts{user} = $1 if ($opts{user} =~ /^([\w-]+)$/);
+    # perform operations without notifying user
+    $opts{quiet} = 1;
+    # become user so synchronization will work correctly
+    my $uid = getpwnam($opts{user});
+    setuid($uid) if (defined $uid);
+    die "Unable to setuid to user\n"
+        if (!defined $uid || $< != $uid || $> != $uid);
+} else {
+    $opts{user} = getpwuid($<);
+}
+if (defined $opts{host}) {
+    # untaint host
+    $opts{host} = $1 if ($opts{host} =~ /^([\w.-]+)$/);
+} elsif ($opts{get} || $opts{put}) {
+    die "No host name given\n";
+}
+if (defined $opts{id}) {
+    # untaint id.cid
+    ($opts{id}, $opts{cid}) = ($1, $2) if ($opts{id} =~ /^(\d+)(\.\d+)?$/);
+}
+if (defined $opts{search}) {
+    # unescape whitespace and special characters in search string
+    $opts{search} = unescape($opts{search});
+}
+
+# replace %u with user in config and make directory if necessary;
+if ($conf{user_dir} =~ s/%u/$opts{user}/g) {
+    if (-e $conf{user_dir} && ! -d $conf{user_dir}) {
+        die "$conf{user_dir} exists and is not a directory\n";
+    } elsif (! -d $conf{user_dir}) {
+        mkdir($conf{user_dir}, 0700);
+    }
+}
+$conf{udb_file} = "$conf{user_dir}/$opts{user}.db";
+
+if ($opts{put} && !defined $opts{id}) {
+    # new transfer so create identifier and directory
+    my @ids = glob "$conf{user_dir}/$opts{user}.[0-9]*";
+    @ids = map {substr($_, rindex($_, '.') + 1)} @ids;
+    $opts{id} = (sort {$b <=> $a} @ids)[0];
+    $opts{id}++;
+    # untaint id
+    $opts{id} = $1 if ($opts{id} =~ /(\d+)/);
+    $opts{base} = "$conf{user_dir}/$opts{user}.$opts{id}";
+    mkdir $opts{base};
+
+    # initialize tells
+    $meta{$_} = 0 foreach (qw(do tree rtree));
+
+    # initialize log sizes
+    $meta{"$_\_size"} = 0 foreach (qw(do done error meta tree));
+
+    # initialize done, error, size, and total counts
+    foreach (qw(chattr cksum cp ln mkdir sum)) {
+        $meta{"d_$_"} = 0;
+        $meta{"e_$_"} = 0;
+        $meta{"s_$_"} = 0;
+        $meta{"t_$_"} = 0;
+    }
+    $meta{"e_$_"} = 0 foreach (qw(corruption exception));
+
+    # initialize run counts
+    $meta{s_run} = 0;
+    $meta{t_run} = 0;
+    $meta{w_run} = 0;
+    $meta{s_error} = 0;
+    $meta{s_total} = 0;
+    $meta{t_split} = 0;
+
+    # initialize other items
+    $meta{last} = 0;
+    $meta{origin} = $opts{host};
+    $meta{split_id} = 0;
+    $meta{stop} = 0;
+    $meta{time0} = $time;
+
+    # store initial metadata to file
+    put_meta();
+    put_meta(\%meta);
+
+    # return id
+    print "$opts{id}\n";
+} elsif ($opts{mounts}) {
+    # replace mount information in user db
+    while (my $line = <STDIN>) {
+        $line =~ s/\s*\r?\n$//;
+        my %op = split(/[= ]+/, $line);
+        # ignore malformed lines with undefined op values
+        next if (grep(!/./, values %op));
+        if ($op{args} eq 'mount') {
+            # eliminate any random double slashes that crept in
+            $line =~ s/\/\//\//g;
+            $udb{"mount_$op{host}:$op{local}"} = $line;
+        } elsif ($op{args} eq 'shell') {
+            $udb{"shell_$op{host}"} = 1;
+        }
+    }
+    # store user db to file
+    nstore(\%udb, $conf{udb_file});
+
+    # synchronize user db
+    if ($conf{sync_hook}) {
+        my $cmd = $conf{sync_hook};
+        # replace %d with base user directory
+        $cmd =~ s/%d/$conf{user_dir}/g;
+        # replace %f with user db file
+        $cmd =~ s/%f/$opts{user}.db/g;
+        system($cmd);
+    }
+    exit;
+} elsif ($opts{meta}) {
+    meta();
+    exit;
+} elsif ($opts{history}) {
+    history();
+    exit;
+} elsif (!defined $opts{id} && defined $opts{status}) {
+    status();
+    exit;
+} elsif (!defined $opts{id}) {
+    die "Invalid options\n";
+} else {
+    $opts{base} = "$conf{user_dir}/$opts{user}.$opts{id}";
+}
+if (! -d $opts{base}) {
+    if ($opts{get} || $opts{put}) {
+        print "args=stop\n";
+        # exit with success so old crontabs fail in loop
+        exit;
+    }
+    die "Invalid identifier\n";
+}
+
+# prevent other processes from accessing files
+lock_id();
+
+if ($opts{lock}) {
+    # indicate ok to proceed
+    print "OK\n";
+    STDIN->flush;
+    $SIG{ALRM} = sub {exit 1};
+    alarm 300;
+    # block until alarm or connection closed
+    <STDIN>;
+    exit;
+}
+
+# retrieve metadata from file
+%meta = %{get_meta()};
+$opts{meta_pack} = unpack("H*", pack("Q", $meta{meta_size}));
+
+# perform requested actions that require only metadata read access
+if (defined $opts{status} && $opts{state} eq 'none') {
+    print status();
+    exit;
+} elsif (defined $opts{status}) {
+    id_status();
+    exit;
+} elsif ($opts{restart} && !($meta{stop} || $meta{e_mkdir} || $meta{time1} &&
+        sum(map {$meta{"e_$_"}} qw(chattr cksum cp ln sum)) > 0)) {
+    die "Only transfers in stop or error states can be restarted\n";
+}
+
+# initialize next metadata line so can detect interruption
+put_meta();
+
+# initialize other items for hosts that have never been seen
+if (defined $opts{host} && !defined $meta{"host_$opts{host}"}) {
+    $meta{"clients_$opts{host}"} = 1;
+    $meta{"host_$opts{host}"} = 1;
+    $meta{ohosts}++;
+}
+
+# create host-specific doing log if doesn't already exist
+$opts{doing} = "doing_$opts{host}$opts{cid}";
+$opts{doing_log} = "$opts{base}/$opts{doing}";
+if (! -f $opts{doing_log} && ($opts{get} || $opts{put})) {
+    open(FILE, '>', $opts{doing_log});
+    close FILE;
+    $meta{$opts{doing}} = 0;
+}
+
+# update last access time
+$meta{"last_$opts{host}"} = $time
+    if ($opts{alive} || $opts{get} || $opts{put});
+
+# track client pids to prevent inadvertent simultaneous processing
+if ($opts{pid}) {
+    my $pids = "pids_$opts{host}$opts{cid}";
+    if ($meta{$pids} !~ /(?:^|,)$opts{pid}(?:,|$)/) {
+        # a new process has taken over the transfer
+        $meta{$pids} .= "," if ($meta{$pids});
+        $meta{$pids} .= $opts{pid};
+    }
+}
+
+# perform put separately so it can be combined with other operations
+put() if ($opts{put} && (!$opts{pid} ||
+          # only process puts of most recent client
+          $meta{"pids_$opts{host}$opts{cid}"} =~ /(?:^|,)$opts{pid}$/));
+
+# perform requested actions that require metadata write access
+if ($opts{stop}) {
+    $meta{stop} = 1;
+    $meta{time1} = $time;
+} elsif ($opts{restart}) {
+    # clear counts
+    $meta{"e_$_"} = 0 foreach (qw(chattr cksum cp ln mkdir sum));
+    $meta{$_} = 0 foreach (qw(stop s_run t_run w_run));
+    delete $meta{time1};
+    # clear host/client info so clients can be respawned
+    $meta{ohosts} = 0;
+    delete $meta{$_} foreach
+        (grep(/^(clients|email|host|last|load|pids|shell|sleep|version|warn)_/,
+            keys %meta));
+
+    # move all failed operations back into do
+    open(DO, '>>', "$opts{base}/do");
+    open(ERROR, '+<', "$opts{base}/error");
+    while (<ERROR>) {
+        # reset number of attempts
+        s/((^|\s)try=)\d+/${1}0/;
+        print DO $_;
+    }
+    # clear error contents
+    truncate(ERROR, 0);
+    close ERROR;
+
+    # move all running operations back into do
+    foreach my $file (glob "$opts{base}/doing_*") {
+        my $log = $file;
+        $log =~ s/.*\///;
+        # untaint file
+        $file = $1 if ($file =~ /^(.*)$/);
+        open(FILE, '+<', $file);
+        seek(FILE, $meta{$log}, 0);
+        while (my $line = <FILE>) {
+            $line =~ s/\s*\r?\n$//;
+            if ($line !~ /^ /) {
+                # record position and skip processing if already done
+                $meta{$log} = tell FILE;
+                next;
+            }
+
+            # record operation as done so not retried later
+            my $tell = $meta{$log};
+            $meta{$log} = tell FILE;
+            seek(FILE, $tell, 0);
+            print FILE $opts{meta_pack};
+            seek(FILE, $meta{$log}, 0);
+
+            # put operation in do
+            my %op = split(/[= ]+/, substr($line, 16));
+            delete $op{$_} foreach (qw(doing rate run time));
+            # do not delete hash when retrying cksum
+            delete $op{hash} if ($op{args} !~ /^cksum/);
+            print DO join(" ", map {"$_=$op{$_}"} sort(keys %op)), "\n";
+        }
+    }
+
+    close DO;
+} elsif ($opts{get} && ($meta{stop} || $meta{time1} || $meta{e_mkdir} ||
+        # stop client if a new process has taken over
+        $meta{"pids_$opts{host}$opts{cid}"} =~ /(?:^|,)$opts{pid},/)) {
+    print "args=stop\n";
+} elsif ($opts{get}) {
+    get();
+} elsif ($opts{alive}) {
+    # host has functional cron if --alive used
+    $meta{"cron_$opts{host}"} = 1;
+    print "args=stop\n" if ($meta{stop} || $meta{time1} || $meta{e_mkdir});
+}
+#TODO: option to list operations or state of each client host
+
+# send email status updates
+email_status()
+    if ($meta{mail} && !$opts{quiet} && $opts{put} && $conf{email_domain});
+
+# update log sizes
+foreach my $file (glob "$opts{base}/*") {
+    next if ($file =~ /lock$/);
+    my $log = $file;
+    $log =~ s/.*\///;
+    $meta{"$log\_size"} = (stat $file)[7];
+}
+
+# store metadata to file
+put_meta(\%meta);
+
+# synchronize log files
+if ($conf{sync_hook}) {
+    my $cmd = $conf{sync_hook};
+    # replace %d with base user directory
+    $cmd =~ s/%d/$conf{user_dir}/g;
+    # replace %f with status directory
+    $cmd =~ s/%f/$conf{user_dir}\/$opts{user}.$opts{id}/g;
+    system($cmd);
+}
+
+# detach process during cleanup
+close STDIN;
+close STDOUT;
+close STDERR;
+setsid;
+open(STDIN, "</dev/null");
+open(STDOUT, ">/dev/null");
+open(STDERR, ">/dev/null");
+
+# remove status directories older than expiration time
+foreach my $dir (glob "$conf{user_dir}/$opts{user}.[0-9]*") {
+    # untaint dir (should be user.id under base user directory)
+    $dir = $1 if ($dir =~ /^(\Q$conf{user_dir}\E\/\Q$opts{user}\E\.\d+)$/);
+    my $id = $dir;
+    $id =~ s/.*\.//;
+    # do not remove directory associated with this manager invocation
+    next if ($id == $opts{id});
+    my $mtime = (stat("$dir/meta"))[9];
+    if ($mtime + $conf{data_expire} < $time) {
+        rmtree($dir);
+        # synchronize deleted directory
+        if ($conf{sync_hook}) {
+            my $cmd = $conf{sync_hook};
+            # replace %d with base user directory
+            $cmd =~ s/%d/$conf{user_dir}/g;
+            # replace %f with status directory
+            $cmd =~ s/%f/$dir/g;
+            system($cmd);
+        }
+    }
+}
+
+#####################
+#### debug_print ####
+#####################
+# print given text from get to stdout and mirror to file if debugging enabled
+sub debug_print {
+    my $type = shift;
+    if ($conf{debug} || $conf{"debug_$opts{user}"}) {
+        # open user-specific debug file if not already open
+        open($dbgfh, '>>', "$conf{user_dir}/$opts{user}.debug") if (!$dbgfh);
+        print $dbgfh "$localtime $opts{host} $opts{id}$opts{cid} $type ";
+        print $dbgfh $_ foreach (@_);
+    }
+    if ($type eq 'GET') {
+        print $_ foreach (@_);
+    }
+}
+
+########################
+#### default_select ####
+########################
+# return random host whose sshd is pingable from set of given hosts
+sub default_select {
+    # choose original host if available
+    my $host = shift;
+    my @hosts = @_;
+    my $np = Net::Ping->new('tcp', 1);
+    $np->port_number(22);
+    do {
+        # check availability via tcp ping to ssh port
+        return $host if ($np->ping($host));
+        # pick random host
+        $host = splice(@hosts, rand @hosts, 1);
+    } while ($host);
+    return undef;
+}
+
+######################
+#### email_status ####
+######################
+# send invoking user email with current status
+sub email_status {
+    # obtain status by parsing status() output
+    my $table = status();
+    my @rows = split(/\n/, $table);
+    my @cols = split(/\s*\|\s*/, $rows[3]);
+    # ignore warnings when --sync used
+    $cols[1] =~ s/\+warn// if ($meta{sync});
+    $cols[1] =~ s/run\+//;
+    # abort if running or have sent this message type before
+    return if ($cols[1] eq 'run' || $meta{"email_$cols[1]"});
+
+    # show original command so will be correct for user's installation
+    my $ucmd = $meta{command};
+    # customized escape to allow ' ', ':', '=', and '\'
+    $ucmd =~ s/([^A-Za-z0-9\- :=\\_.!~*'()\/])/sprintf("%%%02X", ord($1))/eg;
+    my $cmd = $ucmd;
+    $cmd =~ s/(^\S*(?:\s+|\/)shiftc?[^\s\/]*)(?:\s|$).*/$1/;
+
+    # use simple html pre wrapper so will show correctly on html/text clients
+    my $msg = "<html><body><pre>\n";
+    $msg .= "#" x length($ucmd);
+    $msg .= "\n$ucmd\n";
+    $msg .= "#" x length($ucmd);
+
+    # status table is always shown
+    $msg .= "\n\n$table";
+    # record email type to prevent duplicate emails
+    $meta{"email_$cols[1]"} = $time;
+    if ($cols[1] =~ s/warn/warning/) {
+        my $stable = id_status('warn');
+        if (($stable =~ tr/\n/\n/) == 23) {
+            # subset of warnings
+            $msg .= "\n\nThe first 10 warnings encountered are shown below.";
+            $msg .= "\nTo show the complete set, run the following:\n\n";
+            $msg .= "    $cmd --id=$opts{id} --status --state=warn";
+        } else {
+            # all warnings
+            $msg .= "\n\nThe set of the warnings encountered is shown below.";
+        }
+        $msg .= "\n\nTo stop this transfer, run the following:\n\n";
+        $msg .= "    $cmd --id=$opts{id} --stop\n";
+        $msg .= "\n\n" . $stable . "\n\n";
+    }
+    if ($cols[1] =~ /error/) {
+        my $stable = id_status('error');
+        if (($stable =~ tr/\n/\n/) == 23) {
+            # subset of errors
+            $msg .= "\n\nThe first 10 errors encountered are shown below.";
+            $msg .= "\nTo show the complete set, run the following:\n\n";
+            $msg .= "    $cmd --id=$opts{id} --status --state=error";
+        } else {
+            # all errors
+            $msg .= "\n\nThe set of the errors encountered is shown below.";
+        }
+        $msg .= "\n\nTo retry the failed/incomplete portions of this transfer,";
+        $msg .= "\nrun the following on $meta{origin} (or equivalent):\n\n";
+        $msg .= "    $cmd --id=$opts{id} --restart\n";
+        $msg .= "\n\n" . $stable . "\n\n";
+    }
+    $msg .= "</pre></body></html>\n";
+
+    # send message using server on localhost
+    Mail::Sendmail::sendmail(
+        Smtp => 'localhost',
+        From => "$opts{user}\@$conf{email_domain}",
+        To => "$opts{user}\@$conf{email_domain}",
+        Subject => "shift transfer $opts{id} $cols[1]",
+        Message => $msg,
+        'Content-Type' => "text/html",
+    );
+}
+
+################
+#### escape ####
+################
+# return uri-escaped version of given string
+sub escape {
+    my $text = shift;
+    $text =~ s/([^A-Za-z0-9\-\._~\/])/sprintf("%%%02X", ord($1))/eg
+        if (defined $text);
+    return $text;
+}
+
+##################
+#### unescape ####
+##################
+# return uri-unescaped version of given string
+sub unescape {
+    my $text = shift;
+    $text =~ s/%([0-9A-Fa-f]{2})/chr(hex($1))/eg if (defined $text);
+    return $text;
+}
+
+########################
+#### format_seconds ####
+########################
+# return human-readable time output for given number of seconds
+sub format_seconds {
+    my $rem = shift;
+    my $secs;
+    foreach my $unit (sort {$seconds{$b} <=> $seconds{$a}} keys(%seconds)) {
+        # keep dividing by largest unit
+        my $div = int($rem / $seconds{$unit});
+        $rem %= $seconds{$unit};
+        # concatenate each result
+        $secs .= "$div$unit" if ($div);
+    }
+    return $secs ? $secs : "0s";
+}
+
+######################
+#### format_bytes ####
+######################
+# return human-readable size output for given number of bytes
+sub format_bytes {
+    my $nbytes = shift;
+    foreach my $unit (sort {$bytes{$b} <=> $bytes{$a}} keys(%bytes)) {
+        if (abs $nbytes >= $bytes{$unit}) {
+            # use 3 significant digits in fixed/scientific notation with unit
+            return sprintf("%.3g$unit\B", $nbytes / $bytes{$unit});
+        }
+    }
+    # use 1 significant digit for fractional values
+    return sprintf("%.1f\B", $nbytes) if ($nbytes < 1);
+    # use 3 significant digits in fixed/scientific notation without unit
+    return sprintf("%.3g\B", $nbytes);
+}
+
+#############
+#### get ####
+#############
+# output a set of operations for the invoking client to process
+sub get {
+    if ($meta{"host_$opts{host}"} == 1) {
+        $meta{"host_$opts{host}"} = 2;
+        # host retrieving operations so reduce outstanding hosts
+        $meta{ohosts}--;
+    }
+
+    # retrieve global database from file
+    eval {
+        local $SIG{__WARN__} = sub {die};
+        %db = %{retrieve($conf{db_file})};
+    };
+    if ($@) {
+        # database could not be opened
+        %db = ();
+    }
+
+    # retrieve user database from file
+    eval {
+        local $SIG{__WARN__} = sub {die};
+        %udb = %{retrieve($conf{udb_file})};
+    };
+    if ($@) {
+        # database could not be opened
+        %udb = ();
+    }
+
+    if ($meta{"warn_$opts{host}$opts{cid}"} == 1) {
+        # use exponential backoff
+        my $sleep = 1 << $meta{"sleep_$opts{host}$opts{cid}"};
+        $sleep = 10 + int(rand($sleep)) * 60;
+        # wait for more files or for transfer to be done
+        debug_print('GET', "args=sleep,$sleep\n");
+        # keep doubling sleep time up to an hour
+        $meta{"sleep_$opts{host}$opts{cid}"}++
+            if ($meta{"sleep_$opts{host}$opts{cid}"} < 6);
+        return;
+    } elsif ($meta{"warn_$opts{host}$opts{cid}"} == 0) {
+        # progress has been made so reset sleep timer
+        $meta{"sleep_$opts{host}$opts{cid}"} = 0;
+    }
+
+    # throttle if load beyond given resource limits
+    my %load = split(/[= ]+/, $meta{"load_$opts{host}"});
+    if ($load{io}) {
+        # only throttle if there was some i/o load generated
+        my $sleep;
+        foreach my $key (qw(cpu disk io net)) {
+            if ($meta{$key} && $load{$key} && $load{$key} > $meta{$key}) {
+                my $tmp = $key eq 'disk' ? 600 :
+                    $load{time} * ($load{$key} / $meta{$key} - 1);
+                $sleep = $tmp if ($tmp > $sleep);
+            }
+        }
+        if ($sleep > 0) {
+            debug_print('GET', "args=sleep,$sleep\n");
+            return;
+        }
+    }
+
+    # determine logs to process
+    my @logs = ("tree", $opts{doing});
+    my %sizes = ($opts{doing} => (stat $opts{doing_log})[7]);
+    # add operations from hosts that have cron and have timed out
+    foreach my $cron (grep(/^cron_/, keys %meta)) {
+        my $host = substr($cron, 5);
+        if ($meta{"last_$host"} + 1800 < $time) {
+            # idle for 30 minutes
+            if ($host ne $opts{host}) {
+                push(@logs, "doing_$host");
+                # add logs for extra clients
+                foreach my $i (2..$meta{clients}) {
+                    push(@logs, "doing_$host.$i");
+                }
+            }
+        }
+    }
+    push(@logs, qw(do rtree));
+
+    open(DOING, '>>', $opts{doing_log});
+    open(ERROR, '>>', "$opts{base}/error");
+    #TODO: need error if cannot be opened
+    my ($size, $files, $ops, $all);
+    my %localfs;
+    LOG: foreach my $log (@logs) {
+        # process dir attrs last by themselves in a single batch
+        last if ($log eq 'rtree' && (!$meta{last} || $meta{t_run} || $ops ||
+                 !$meta{check} || !$meta{preserve}));
+        my $fh;
+        if ($log eq 'rtree') {
+            $fh = IO::File->new("$opts{base}/tree");
+        } elsif ($log =~ /^doing_/) {
+            # need read/write access to doing log
+            $fh = IO::File->new("$opts{base}/$log", 'r+');
+        } else {
+            $fh = IO::File->new("$opts{base}/$log");
+        }
+        $fh->seek($meta{$log}, 0);
+        next if (!defined $fh);
+        #TODO: need error if cannot be opened or seeked
+        my $line;
+        while (($log =~ /tree$/ || $size < $meta{size} &&
+                $files < $meta{files}) &&
+                ($log ne 'rtree' && defined($line = $fh->getline) ||
+                $log eq 'rtree' && defined($line = last_line($fh)))) {
+            $line =~ s/\s*\r?\n$//;
+            # first line of rtree will be blank
+            next if (!$line);
+            # prevent loop of current host doing log
+            next LOG if (defined $sizes{$log} && $fh->tell > $sizes{$log});
+
+            if ($log =~ /^doing_/) {
+                if ($line !~ /^ /) {
+                    # record position and skip processing if already done
+                    $meta{$log} = $fh->tell;
+                    next;
+                }
+                $line = substr($line, 16);
+            }
+
+            my %op = split(/[= ]+/, $line);
+            my @args = split(/,/, $op{args});
+            my $cmd = shift @args;
+            my $save_arg = $args[-1];
+
+            if ($log =~ /^doing_/) {
+                # this operation was originally not completed so record failure
+                $meta{s_run} -= $op{size};
+                $meta{t_run}--;
+                $op{text} = escape("Host or process failure");
+                if ($op{try} >= $meta{retry}) {
+                    # record as error and abort
+                    my $tell = $meta{$log};
+                    $meta{$log} = $fh->tell;
+                    $fh->seek($tell, 0);
+                    # mark operation as done in case dead host reports in
+                    $fh->print($opts{meta_pack});
+                    $fh->seek($meta{$log}, 0);
+                    $line =~ s/(^|\s)text=\S+//;
+                    print ERROR $line, " text=$op{text}\n";
+                    $meta{s_error} += $op{size};
+                    $meta{"e_$cmd"}++;
+                    $meta{"e_$op{tool}"}++;
+                    $meta{time1} = $time if ($meta{last} && !run());
+                    next;
+                } else {
+                    # record as warning and retry
+                    $op{try}++;
+                    $meta{w_run}++;
+                    $op{state} = 'warn';
+                }
+            }
+
+            for (my $i = 0; $i < scalar(@args); $i++) {
+                # skip arg 1 of ln/ln chattr since it's a name and not a file
+                next if (!$i && ($cmd eq 'ln' || $cmd eq 'chattr' && $op{ln}));
+                my $ref = {};
+                # write access needed for last arg of chattr/cp/ln/mkdir
+                my $ref->{rw} = $cmd =~ /^(?:chattr|cp|ln|mkdir)/ &&
+                    $i == scalar(@args) - 1 ? 1 : 0;
+                if ($args[$i] !~ /^\//) {
+                    $args[$i] = map_remote($opts{host}, $args[$i], $ref);
+                    last LOG if (!defined $args[$i]);
+                } else {
+                    my $new = map_local($op{host}, $args[$i], $opts{host}, $ref);
+                    if (defined $new) {
+                        $args[$i] = $new;
+                        $localfs{$ref->{local}} |= $ref->{rw}
+                            if ($ref->{local});
+                    } elsif ($meta{"host_$opts{host}"}) {
+                        # host does not have access to appropriate
+                        # file system and host name hasn't changed
+                        last LOG;
+                    }
+                }
+
+                my $loc = $i == 0 && $cmd ne 'mkdir' ? "src" : "dst";
+                if ($cmd eq 'cp' && $ref->{dmi} && $log !~ /^doing_/) {
+                    # client needs to perform dmf processing
+                    $op{dmi} .= $loc if ($op{dmi} !~ /$loc/);
+                }
+                if ($cmd =~ /^(?:cp|mkdir)/ && $ref->{lustre} &&
+                        $log !~ /^doing_/) {
+                    # client needs to perform lustre striping
+                    $op{lustre} .= $loc if ($op{lustre} !~ /$loc/);
+                }
+            }
+
+            # never count mkdir or chattr on dir against the file total
+            $files++ if (scalar(@args) > 1);
+            $size += $op{size} if ($cmd =~ /^(?:cp|sum|cksum)/);
+            $ops++ if ($log ne 'rtree');
+            $all++;
+            $meta{s_run} += $op{size};
+            $meta{t_run}++;
+            $meta{w_run}-- if ($op{state} eq 'warn');
+
+            my $tell = $meta{$log};
+            $meta{$log} = $fh->tell;
+            if ($log =~ /^doing_/) {
+                $fh->seek($tell, 0);
+                # mark operation as done in case dead host reports in
+                $fh->print($opts{meta_pack});
+                $fh->seek($meta{$log}, 0);
+            }
+
+            # rtree is for preserving directory attributes
+            $cmd = "chattr" if ($log eq 'rtree');
+            # rejoin mapped arguments
+            $op{args} = join(",", $cmd, @args);
+            $op{host} = $opts{host};
+            $op{run} = $time;
+            $op{doing} = tell DOING;
+            delete $op{state};
+            delete $op{tool};
+
+            # dynamically insert tar_last for last record of last tar file
+            if ($meta{'create-tar'} && defined $meta{tar_last_size} &&
+                    $meta{tar_last_file} eq $save_arg) {
+                my ($t1, $t2) = split(/-/, $op{tar_bytes});
+                if ($meta{tar_last_size} < $t2 + 512) {
+                    $op{tar_last} = 1;
+                    # only insert very first time (will be propagated)
+                    delete $meta{tar_last_size};
+                    # leave tar_last_file for special mv handling
+                }
+            }
+
+            my $get = join(" ", map {"$_=$op{$_}"} sort(keys %op)) . "\n";
+            print DOING " " x 16, $get;
+            debug_print('GET', $get);
+        }
+        $fh->close;
+    }
+
+    if ($meta{last} && !$all && !$meta{t_run} && $meta{tar_mv} &&
+            defined $meta{tar_last_file}) {
+        my $get = "args=chattr,$meta{tar_last_file} host=$opts{host}";
+        $get .= " size=0 tar_mv=1 run=$time doing=" . (tell DOING) . "\n";
+        print DOING " " x 16, $get;
+        debug_print('GET', $get);
+        $all++;
+        $meta{t_run}++;
+        delete $meta{tar_last_file};
+    } elsif (!$all) {
+        if ($meta{last} && !$meta{t_run}) {
+            # no retries and none running so stop
+            debug_print('GET', "args=stop\n");
+            $meta{"sleep_$opts{host}$opts{cid}"} = 0;
+        } else {
+            # use exponential backoff
+            my $sleep = 1 << $meta{"sleep_$opts{host}$opts{cid}"};
+            $sleep = 10 + int(rand($sleep)) * 60;
+            # wait for more files or for transfer to be done
+            debug_print('GET', "args=sleep,$sleep\n");
+            # keep doubling sleep time up to an hour
+            $meta{"sleep_$opts{host}$opts{cid}"}++
+                if ($meta{"sleep_$opts{host}$opts{cid}"} < 6);
+        }
+    }
+    close DOING;
+    close ERROR;
+    return if (!$all);
+
+    debug_print('GET', "args=getopt,local text=",
+        # use given transport if specified
+        $meta{local} ? $meta{local} : $conf{default_local}, "\n");
+    debug_print('GET', "args=getopt,remote text=",
+        # use secure transport if encryption enabled
+        $meta{encrypt} ? $conf{default_secure} :
+            # use given transport if specified
+            ($meta{remote} ? $meta{remote} :
+            # use small transport if avg file size less than 128MB and
+            # actual batch size is less than 4x max batch size
+            ($size / ($files + 1) < 128E6 && $size < 4 * $meta{size} ?
+                $conf{default_small} : $conf{default_remote})), "\n");
+    foreach (qw(check create-tar cron encrypt extract-tar index-tar offline
+                no-stripe preserve verify verify-fast)) {
+        debug_print('GET', "args=getopt,$_\n") if ($meta{$_});
+    }
+    debug_print('GET', "args=getopt,stripe text=$meta{stripe}\n");
+
+    if (grep(/^host_/, keys %meta) < $meta{hosts} ||
+            $meta{"clients_$opts{host}"} < $meta{clients}) {
+        # run client on other/same hosts if there are enough files
+        my $qfiles = $meta{t_split} - $meta{t_run};
+        $qfiles += $meta{"t_$_"} - $meta{"d_$_"} - $meta{"e_$_"}
+            foreach (qw(chattr cksum cp ln mkdir sum));
+        my $qsize = $meta{s_total} - $meta{s_run} - $meta{s_error};
+        $qsize += 2 * $meta{s_total} if ($meta{verify});
+        $qsize -= $meta{"s_$_"} foreach (qw(cksum cp sum));
+        my $nclients;
+        if ($qsize * $meta{files} > $qfiles * $meta{size}) {
+            # queue avg size per file greater than limit avg size per file
+            # estimate nclients based on queue sizes
+            $nclients = 1.0 * $qsize / $meta{size};
+            # don't use more hosts than number of files
+            $nclients = $qfiles if ($nclients > $qfiles);
+        } else {
+            # queue avg size per file less than limit avg size per file
+            # estimate nclients based on queue files
+            $nclients = 1.0 * $qfiles / $meta{files};
+        }
+
+        # reduce by outstanding hosts
+        $nclients -= $meta{ohosts};
+        my @hosts;
+        if ($nclients > 0 && scalar(keys %localfs) > 0) {
+            my @hosts;
+            if ($meta{'host-list'}) {
+                # use given host list
+                @hosts = split(/,/, $meta{'host-list'});
+            } else {
+                # find accessible hosts based on global/user db
+                push(@hosts, grep(/^shell_/, keys %meta));
+                push(@hosts, grep(/^shell_/, keys %db));
+                push(@hosts, grep(/^shell_/, keys %udb));
+            }
+            HOST: while ($nclients > 0 && scalar(@hosts) > 0 &&
+                    grep(/^host_/, keys %meta) < $meta{hosts}) {
+                # choose random host
+                my $host = splice(@hosts, rand @hosts, 1);
+                $host =~ s/^shell_//;
+                next if ($meta{"host_$host"} || $meta{"nohost_$host"});
+                #TODO: hosts with both local/remote access should be first
+                if (!$meta{'host-list'}) {
+                    foreach my $fs (keys %localfs) {
+                        next HOST if (!map_local(
+                            $opts{host}, $fs, $host, {rw => $localfs{$fs}}));
+                    }
+                }
+                debug_print('GET', "args=host,$host\n");
+                $meta{"host_$host"} = 1;
+                $meta{"clients_$host"} = 1;
+                $meta{ohosts}++;
+                $nclients--;
+            }
+        }
+
+        # spawn extra clients on invoking host if enough work remains
+        while ($nclients > 0 && $meta{"clients_$opts{host}"} < $meta{clients}) {
+            $nclients--;
+            debug_print('GET', "args=client,$opts{id}.",
+                ++$meta{"clients_$opts{host}"}, "\n");
+        }
+    }
+}
+
+##################
+#### get_meta ####
+##################
+# return (and possibly revert to) last validated metadata from given meta file
+sub get_meta {
+    my $mfile = shift;
+    my $past = shift;
+    my $mtell;
+    if (!defined $mfile) {
+        $mfile = "$opts{base}/meta";
+        $mtell = 0;
+    }
+    my $meta;
+    my $fh;
+    open($fh, '<', $mfile);
+    $fh->seek(-1, 2);
+    while (1) {
+        my $line = last_line($fh);
+        last if (!defined $line);
+        $meta = substr($line, 1, -1);
+        last if (substr($line, 0, 1) eq '[' && substr($line, -1, 1) eq ']' &&
+                (!defined $past || !--$past));
+        $meta = undef;
+        $mtell = $fh->tell + 1 if (defined $mtell);
+    }
+    close $fh;
+
+    if ($meta) {
+        my $zmeta64 = decode_base64($meta);
+        my $zmeta = uncompress($zmeta64);
+        $meta = thaw($zmeta);
+    }
+    if ($meta && defined $mtell && $mtell > 0) {
+        # metadata corrupted so revert to last known good state
+        foreach my $file (glob "$opts{base}/*") {
+            next if ($file =~ /(?:lock|meta)$/);
+            my $log = $file;
+            $log =~ s/.*\///;
+            my $size = defined $meta->{"$log\_size"} ? $meta->{"$log\_size"} : 0;
+            # untaint file
+            $file = $1 if ($file =~ /^(.*)$/);
+            # truncate all logs to last known good size
+            truncate($file, $size);
+            if ($log =~ /^doing_/ && defined $meta->{"$log\_size"}) {
+                # undo all operations that were processed after last good state
+                open(FILE, '+<', $file);
+                my $tell0 = $meta->{"$log\_size"};
+                seek(FILE, $tell0, 0);
+                while (<FILE>) {
+                    my $tell = tell FILE;
+                    my $msize = substr($_, 0, 16);
+                    $msize = unpack("Q", pack("H*", $msize));
+                    if ($msize > $meta->{meta_size}) {
+                        seek(FILE, $tell0, 0);
+                        print FILE " " x 16;
+                        seek(FILE, $tell, 0);
+                    }
+                    $tell0 = $tell;
+                }
+                close FILE;
+            }
+        }
+        # truncate last in case any other operations interrupted
+        truncate($mfile, $mtell);
+    }
+    #TODO: handle errors;
+    return $meta;
+}
+
+#################
+#### history ####
+#################
+# output table of hosts and commands for invoking user
+sub history {
+    # configure table headers
+    my $t = Text::FormatTable->new('r | l | l');
+    $t->head(qw(id origin command));
+    $t->rule;
+    # sort by modification time of meta file
+    foreach my $file (sort {(stat $a)[9] <=> (stat $b)[9]}
+            glob "$conf{user_dir}/$opts{user}.*/meta") {
+        my $id = $file;
+        $id =~ s/.*\.|\/meta//g;
+        next if (defined $opts{id} && $opts{id} != $id);
+        # retrieve metadata from file
+        %meta = %{get_meta($file)};
+        # ignore rows that do not match optional search
+        next if ($opts{search} &&
+            join(" ", $meta{origin}, $meta{command}) !~ qr/$opts{search}/);
+        # add row for each transfer
+        my $cmd = $meta{command};
+        # limit length of command line for performance/usability
+        my $dindex = rindex($cmd, " ");
+        $cmd = substr($cmd, 0, rindex($cmd, " ", 1024)) . "..." .
+            substr($cmd, $dindex) if ($dindex > 1024);
+        $t->row($id, "$meta{origin}\n[$meta{cwd}]", $cmd);
+    }
+    # output final table
+    print $t->render;
+}
+
+###################
+#### id_status ####
+###################
+# output detailed table of all relevant operations in current transfer or
+# return subset of table in given state
+sub id_status {
+    my $state = shift;
+    my $nrows = 10000;
+    my $once = 0;
+    if (defined $state) {
+        # this is used in email_status() to send a subset of errors/warnings
+        $nrows = 10;
+        $once = 1;
+    } else {
+        # user only wants items in a particular state
+        $state = $opts{state};
+    }
+
+    my $t0 = Text::FormatTable->new('l | l | l | r | r | r | r');
+    my @row = (qw(state op target size date length rate));
+    my @row2 = ("", "tool", "info", "", "time", "", "");
+    if ($opts{status} eq 'csv') {
+        print join(",", @row, @row2), "\n";
+    } else {
+        $t0->head(@row);
+        $t0->head(@row2);
+        $t0->rule;
+    }
+
+    my $rows = 0;
+    my $t = dclone($t0);
+
+    if (!$state || $state =~ /^(?:queue|warn)$/) {
+        # queued/warn operations are found in the do log
+        open(FILE, '<', "$opts{base}/do");
+        seek(FILE, $meta{do}, 0);
+        while (<FILE>) {
+            chomp;
+            # unescape colons in remote paths
+            s/%3A/:/g;
+            my %op = split(/[= ]+/);
+            my @args = split(/,/, $op{args});
+            # ignore rows that do not match optional search
+            next if ($opts{search} && join(" ", @args) !~ qr/$opts{search}/);
+            my $size = "-";
+            $size = format_bytes($op{size}) if ($args[0] =~ /^(?:cksum|cp|sum)/);
+            if ($op{state} eq 'warn' && (!$state || $state eq 'warn')) {
+                # add first row for each operation with bulk of information
+                @row = ("warn", $args[0], $args[-1], $size, "-", "-", "-");
+                # add second row for each operation with tool and message
+                @row2 = ("", $op{tool}, unescape($op{text}), "", "", "", "");
+            } elsif ($op{state} ne 'warn' && (!$state || $state eq 'queue')) {
+                @row = ("queue", $args[0], $args[-1], $size, "-", "-", "-");
+                @row2 = ("", "", "", "", "", "", "");
+            } else {
+                next;
+            }
+            if ($opts{status} eq 'csv') {
+                $row2[2] =~ s/"/""/g;
+                $row2[2] = "\"$row2[2]\"" if ($row2[2] =~ /[,"\n]/);
+                print join(",", @row, @row2), "\n";
+            } else {
+                $t->row(@row);
+                $t->row(@row2) if ($row[0] ne 'queue');
+                if (++$rows >= $nrows) {
+                    last if ($once);
+                    # render in multiple parts when large number of rows
+                    print $t->render, "\n";
+                    $t = dclone($t0);
+                    $rows = 0;
+                }
+            }
+        }
+        close FILE;
+    }
+
+    if (!$state || $state eq 'run') {
+        # running operations are found in the doing logs for each host
+        foreach my $file (glob "$opts{base}/doing_*") {
+            my $doing = basename($file);
+            my $host = $doing;
+            $host =~ s/^doing_//;
+            open(FILE, '<', $file);
+            seek(FILE, $meta{$doing}, 0);
+            while (<FILE>) {
+                next if (!/^ /);
+                $_ = substr($_, 16);
+                chomp;
+                # unescape colons in remote paths
+                s/%3A/:/g;
+                my %op = split(/[= ]+/);
+                my @args = split(/,/, $op{args});
+                # ignore rows that do not match optional search
+                next if ($opts{search} && join(" ", @args) !~ qr/$opts{search}/);
+                my $size = "-";
+                $size = format_bytes($op{size}) if ($args[0] =~ /^(?:cksum|cp|sum)/);
+                # add first row for each operation with bulk of information
+                @row = ("run", $args[0], $args[-1], $size,
+                    strftime('%m/%d', localtime($op{run})),
+                    format_seconds($time - $op{run}), "-");
+                # add second row for each operation with tool and message
+                @row2 = ("", $op{tool}, "\@$host" .
+                    ($op{bytes} ? " [$op{bytes})" : ""), "",
+                    strftime('%R', localtime($op{run})), "", "");
+                if ($opts{status} eq 'csv') {
+                    $row2[2] =~ s/"/""/g;
+                    $row2[2] = "\"$row2[2]\"" if ($row2[2] =~ /[,"\n]/);
+                    print join(",", @row, @row2), "\n";
+                } else {
+                    $t->row(@row);
+                    $t->row(@row2);
+                    if (++$rows >= $nrows) {
+                        last if ($once);
+                        # render in multiple parts when large number of rows
+                        print $t->render, "\n";
+                        $t = dclone($t0);
+                        $rows = 0;
+                    }
+                }
+            }
+            close FILE;
+        }
+    }
+
+    if (!$state || $state eq 'error') {
+        # error operations are found in the error log
+        open(FILE, '<', "$opts{base}/error");
+        while (<FILE>) {
+            chomp;
+            # unescape colons in remote paths
+            s/%3A/:/g;
+            my %op = split(/[= ]+/);
+            my @args = split(/,/, $op{args});
+            # ignore rows that do not match optional search
+            next if ($opts{search} && join(" ", @args) !~ qr/$opts{search}/);
+            my $size = "-";
+            $size = format_bytes($op{size}) if ($args[0] =~ /^(?:cksum|cp|sum)/);
+            # add first row for each operation with bulk of information
+            @row = ("error", $args[0], $args[-1], $size, "-", "-", "-");
+            # add second row for each operation with tool and message
+            @row2 = ("", $op{tool}, unescape($op{text}), "", "", "", "");
+            if ($opts{status} eq 'csv') {
+                $row2[2] =~ s/"/""/g;
+                $row2[2] = "\"$row2[2]\"" if ($row2[2] =~ /[,"\n]/);
+                print join(",", @row, @row2), "\n";
+            } else {
+                $t->row(@row);
+                $t->row(@row2);
+                if (++$rows >= $nrows) {
+                    last if ($once);
+                    # render in multiple parts when large number of rows
+                    print $t->render, "\n";
+                    $t = dclone($t0);
+                    $rows = 0;
+                }
+            }
+        }
+        close FILE;
+    }
+
+    if (!$state || $state eq 'done') {
+        # done operations are found in the done log
+        open(FILE, '<', "$opts{base}/done");
+        while (<FILE>) {
+            chomp;
+            # unescape colons in remote paths
+            s/%3A/:/g;
+            my %op = split(/[= ]+/);
+            my @args = split(/,/, $op{args});
+            # ignore rows that do not match optional search
+            next if ($opts{search} && join(" ", @args) !~ qr/$opts{search}/);
+            my $secs = $op{time} > 0 ? $op{time} : 1;
+            my $size = "-";
+            my $rate = "-";
+            if ($args[0] =~ /^(?:cksum|cp|sum)/) {
+                $size = format_bytes($op{size});
+                $rate = format_bytes($op{rate}) . "/s";
+            }
+            my $info;
+            $info = "#$op{hash}" if ($op{hash} && $args[0] =~ /^(?:cp|sum)/);
+            $info .= " " if ($info && $op{bytes});
+            $info .= "[$op{bytes})" if ($op{bytes});
+            $info = "-" if (!$info);
+
+            # add first row for each operation with bulk of information
+            @row = ("done", $args[0], $args[-1], $size,
+                strftime('%m/%d', localtime($op{run})),
+                format_seconds($secs), $rate);
+            # add second row for each operation with tool and message
+            @row2 = ("", $op{tool}, $info, "",
+                strftime('%R', localtime($op{run})), "", "");
+            if ($opts{status} eq 'csv') {
+                $row2[2] =~ s/"/""/g;
+                $row2[2] = "\"$row2[2]\"" if ($row2[2] =~ /[,"\n]/);
+                print join(",", @row, @row2), "\n";
+            } else {
+                $t->row(@row);
+                $t->row(@row2);
+                if (++$rows >= $nrows) {
+                    last if ($once);
+                    # render in multiple parts when large number of rows
+                    print $t->render, "\n";
+                    $t = dclone($t0);
+                    $rows = 0;
+                }
+            }
+        }
+        close FILE;
+    }
+
+    if ($opts{status} ne 'csv') {
+        # return/output final table depending on initial given state
+        $once ? return $t->render : print $t->render;
+    }
+}
+
+#################
+#### init_id ####
+#################
+# initialize settings for transfer based on getopt lines and/or defaults
+sub init_id {
+    # initialize options with default values
+    foreach (qw(clients cpu disk hosts io net retry)) {
+        $meta{$_} = $conf{"default_$_"} if (!defined $meta{$_});
+    }
+
+    # change files unit from billion to gig
+    $meta{files} =~ tr/[bB]/g/ if (defined $meta{files});
+
+    # preserve original split setting
+    $opts{split} = $meta{split};
+
+    # convert size strings to numbers
+    foreach my $key (qw(files size split stripe)) {
+        # stripe can be zero
+        next if ($key eq 'stripe' && defined $meta{$key} && $meta{$key} == 0);
+        if ($meta{$key} =~ /^([1-9]\d*)([kmgt])?$/i) {
+            my $unit = defined $2 ? $2 : '';
+            $meta{$key} = $1 * $bytes{uc $unit};
+        } elsif ($conf{"default_$key"} =~ /^([1-9]\d*)([kmgt])?$/i) {
+            my $unit = defined $2 ? $2 : '';
+            $meta{$key} = $1 * $bytes{uc $unit};
+            # indicate that striping was not specified
+            $meta{'no-stripe'} = 1 if ($key eq 'stripe');
+        }
+        #TODO: else error from bad admin default config
+    }
+
+    # adjust split size to power of 2
+    if ($meta{split} > 0) {
+        my $tmp_ss = $meta{split};
+        my $new_ss = 1;
+        $new_ss <<= 1 while ($tmp_ss >>= 1);
+        # adjust value by 2x if unit string was used (since %bytes power of 10)
+        $new_ss <<= 1 if ($opts{split} =~ /\D/ ||
+                !$opts{split} && $conf{default_split} =~ /\D/);
+        $meta{split} = $new_ss;
+    }
+#TODO: hack for dmf corruption problem
+    $meta{offline} = 0;
+#TODO: end hack
+}
+
+###################
+#### last_line ####
+###################
+# return the line before the current position of a given file handle
+sub last_line {
+    my $fh = shift;
+    my $tell0 = $fh->tell;
+    # return nothing when file is at beginning
+    return undef if ($tell0 == 0);
+    my $tell = $tell0;
+    my ($buf, $line, $len, $pos);
+    do {
+        $tell = $tell0 - 1024;
+        $tell = 0 if ($tell < 0);
+        # seek to earlier position in file
+        $fh->seek($tell, 0);
+        my $len = 1024;
+        $len = $tell0 - $tell if ($len > $tell0);
+        # read up to initial location or that of last round
+        $fh->read($line, $len);
+        $buf = $line . $buf;
+        # find last newline in buffer
+        $pos = rindex($buf, "\n");
+        $tell0 = $tell;
+        # keep looping while no newline found
+    } while ($tell > 0 && $pos < 0);
+    $pos = 0 if ($pos < 0);
+    # set file handle position for next invocation
+    $fh->seek($tell + $pos, 0);
+    # return buffer after newline
+    my $buf = substr($buf, $pos);
+    $buf =~ s/\r?\n//;
+    return $buf;
+}
+
+#################
+#### lock_id ####
+#################
+# lock the current transfer or wait for an unlock
+sub lock_id {
+    open($lockfh, '>', "$opts{base}/lock") || return 0;
+    flock($lockfh, LOCK_EX);
+}
+
+##################
+#### fs_mount ####
+##################
+# return the mount point on the given host holding the given path
+my %fs_cache;
+sub fs_mount {
+    my ($host, $path) = @_;
+    
+    # check cache first to see if mount already computed
+    my $pos = length($path);
+    while (($pos = rindex($path, "/", $pos)) > 0) {
+        my $mnt = $fs_cache{"$host:" . substr($path, 0, $pos-- || 1)};
+        return $mnt if ($mnt);
+    }
+
+    # use mount info provided by global/user db
+    my @mnts = grep(/^mount_\Q$host\E:/, keys %meta);
+    push(@mnts, grep(/^mount_\Q$host\E:/, keys %db));
+    push(@mnts, grep(/^mount_\Q$host\E:/, keys %udb));
+    my %mnt;
+    # sort in descending length order to find greatest prefix
+    foreach (sort {length($b) <=> length($a)} @mnts) {
+        my $mnt = $meta{$_} ? $meta{$_} : ($udb{$_} ? $udb{$_} : $db{$_});
+        %mnt = split(/[= ]+/, $mnt);
+        if ($path =~ /^\Q$mnt{local}\E/) {
+            # path begins with mount point so stop looking
+            last;
+        } else {
+            %mnt = ();
+        }
+    }
+
+    if ($mnt{servers}) {
+        $pos = length($path);
+        while (($pos = rindex($path, "/", $pos)) > 0) {
+            # save in cache to speed up future requests
+            $fs_cache{"$host:" . substr($path, 0, $pos-- || 1)} = \%mnt;
+            last if ($pos < length($mnt{local}));
+        }
+        return \%mnt;
+    }
+    # return undef if local file system
+    return undef;
+}
+
+######################
+#### map_fs_mount ####
+######################
+# return the mount point on the given host that corresponds to the
+# given mount point on another
+my %map_fs_cache;
+sub map_fs_mount {
+    my ($mnt1, $host2) = @_;
+
+    # check cache first to see if mapping already computed
+    my $mnt2 = $map_fs_cache{"$host2:$mnt1"};
+    return $mnt2 if ($mnt2);
+
+    my @srv1 = split(/,/, $mnt1->{servers});
+    # use mount info provided by global/user db
+    my @mnts2 = grep(/^mount_\Q$host2\E:/, keys %meta);
+    push(@mnts2, grep(/^mount_\Q$host2\E:/, keys %db));
+    push(@mnts2, grep(/^mount_\Q$host2\E:/, keys %udb));
+    # sort in descending length order to find greatest prefix
+    foreach (sort {length($b) <=> length($a)} @mnts2) {
+        $mnt2 = $meta{$_} ? $meta{$_} : ($udb{$_} ? $udb{$_} : $db{$_});
+        my %mnt2 = split(/[= ]+/, $mnt2);
+
+        # must have same remote path and type on server
+        if ($mnt1->{remote} eq $mnt2{remote} && $mnt1->{type} eq $mnt2{type}) {
+            # compute intersection of servers
+            my %srv2 = map {$_ => 1} split(/,/, $mnt2{servers});
+            if (grep($srv2{$_}, @srv1)) {
+                # save in cache to speed up future requests
+                $map_fs_cache{"$host2:$mnt1"} = \%mnt2;
+                return \%mnt2;
+            }
+        }
+    }
+    $map_fs_cache{"$host2:$mnt1"} = -1;
+    return -1;
+}
+
+###################
+#### map_local ####
+###################
+# return the equivalent of a given path on a given host on another given host
+sub map_local {
+    my ($host1, $path1, $host2, $ref) = @_;
+    # find file system mount of path on original host
+    my $mnt1 = fs_mount($host1, $path1);
+    if ($host1 eq $host2) {
+        if ($mnt1) {
+            # store mount point
+            $ref->{local} = $mnt1->{local};
+            # store whether a dmf file system
+            $ref->{dmi} = 1 if ($mnt1->{opts} =~ /(?:^|,)dmi(?:$|,)/);
+            # store whether a lustre file system
+            $ref->{lustre} = 1 if ($mnt1->{type} eq 'lustre');
+        }
+        # return original path
+        return $path1;
+    } elsif (!$mnt1) {
+        # no equivalent mount found on host
+        return undef;
+    }
+    my $mnt2 = map_fs_mount($mnt1, $host2);
+    # must have correct mode
+    if ($mnt2 != -1 && (!$ref->{rw} || $mnt2->{opts} =~ /(?:^|,)rw(?:$|,)/)) {
+        # replace original mount point with new mount point
+        $path1 =~ s/^\Q$mnt1->{local}\E/$mnt2->{local}/;
+        # store new mount point
+        $ref->{local} = $mnt2->{local};
+        # store whether a dmf file system
+        $ref->{dmi} = 1 if ($mnt2->{opts} =~ /(?:^|,)dmi(?:$|,)/);
+        # store whether a lustre file system
+        $ref->{lustre} = 1 if ($mnt2->{type} eq 'lustre');
+        return $path1;
+    }
+    return undef;
+}
+
+####################
+#### map_remote ####
+####################
+# return the equivalent of a given remote path on a given host
+my %map_remote_cache;
+sub map_remote {
+    my ($lhost, $path1, $ref) = @_;
+    # remote paths will still be escaped at this point
+    if ($path1 =~ /^([^\/:]+)%3A(\/.*)?/) {
+        my ($rhost, $rpath) = ($1, $2);
+        # check if remote file system exists on local host
+        my $path2 = map_local($rhost, $rpath, $lhost, $ref);
+        return $path2 if (defined $path2);
+
+        # find file system mount of path on original host
+        my $mnt1 = fs_mount($rhost, $rpath);
+        # return original if no mount found
+        return $path1 if (!$mnt1);
+        # check cache first to see if mapping already computed
+        my $mnt2 = $map_remote_cache{"$mnt1->{host}:$mnt1->{local}"};
+        if (!defined $mnt2) {
+            # find accessible hosts based on global/user db
+            my @hosts = grep(/^shell_/, keys %meta);
+            push(@hosts, grep(/^shell_/, keys %db));
+            push(@hosts, grep(/^shell_/, keys %udb));
+            my %sel_hosts;
+            # determine potential hosts
+            foreach my $host (@hosts) {
+                $host =~ s/^shell_//;
+                $mnt2 = map_fs_mount($mnt1, $host);
+                if ($mnt2 != -1) {
+                    # host has access to the file
+                    if (!$ref->{rw} || $mnt2->{opts} =~ /(?:^|,)rw(?:$|,)/) {
+                        # host has proper read/write access
+                        if (!$meta{"pick_$host"} || $meta{"pick_$host"} eq $lhost) {
+                            # host has not been picked for another host
+                            $sel_hosts{$host} = $mnt2;
+                            delete $meta{"pick_$host"};
+                        }
+                    }
+                }
+            }
+
+            $mnt2 = undef;
+            my $sel_host;
+            if (defined $conf{select_hook}) {
+                # select host using configured selection hook
+                my ($fh, $file) = tempfile(UNLINK => 1);
+                close $fh;
+                nstore(\%sel_hosts, $file);
+                # invoke configured selection hook
+                $sel_host = qx($conf{select_hook} $lhost $rhost $file 2>/dev/null);
+            }
+            if (!$sel_host) {
+                # select host using default selection policy
+                $sel_host = default_select($rhost, keys %sel_hosts);
+            }
+            $sel_host =~ s/\s*\r?\n$//;
+            if ($sel_host) {
+                foreach (grep(/^pick_/, keys %meta)) {
+                    # clear previously picked hosts
+                    delete $meta{$_} if ($meta{$_} eq $lhost);
+                }
+                # store that host has already been selected
+                $meta{"pick_$sel_host"} = $lhost;
+                $mnt2 = $sel_hosts{$sel_host};
+                # save in cache to speed up future requests
+                $map_remote_cache{"$mnt1->{host}:$mnt1->{local}"} = $mnt2;
+            }
+        }
+
+        if (!$mnt2) {
+            # store whether a dmf file system
+            $ref->{dmi} = 1 if ($mnt1->{opts} =~ /(?:^|,)dmi(?:$|,)/);
+            # store whether a lustre file system
+            $ref->{lustre} = 1 if ($mnt1->{type} eq 'lustre');
+            # return original path if can't find suitable mount
+            return $path1 
+        }
+
+        # replace original mount point with new mount point
+        $rpath =~ s/^\Q$mnt1->{local}\E/$mnt2->{local}/;
+        # construct remote path using escaped colon after host
+        $rpath = "$mnt2->{host}%3A$rpath";
+        # store whether a dmf file system
+        $ref->{dmi} = 1 if ($mnt2->{opts} =~ /(?:^|,)dmi(?:$|,)/);
+        # store whether a lustre file system
+        $ref->{lustre} = 1 if ($mnt2->{type} eq 'lustre');
+        return $rpath;
+    }
+    return undef;
+}
+
+##############
+#### meta ####
+##############
+# output metadata for all transfers or transfer specified with id option
+sub meta {
+    my $id = $opts{id} ? $opts{id} : "*";
+    foreach my $file (glob "$conf{user_dir}/$opts{user}.$id/meta") {
+        print "$file:\n";
+        # retrieve metadata from file
+        %meta = %{get_meta($file, $opts{meta})};
+        foreach my $key (sort keys(%meta)) {
+            print "  $key = $meta{$key}\n";
+        }
+    }
+}
+
+#############
+#### put ####
+#############
+# record the state of file operations that were processed by a client
+sub put {
+    # open/create log files
+    my %fhs;
+    foreach (qw(do done error tree)) {
+        $fhs{$_} = IO::File->new(">>$opts{base}/$_");
+        #TODO: need error if cannot be opened
+    }
+    $fhs{doing} = IO::File->new("+<$opts{doing_log}");
+    my $doing_size = ($fhs{doing}->stat)[7];
+
+    my %mnts;
+    $meta{"warn_$opts{host}$opts{cid}"} = -1;
+    $SIG{ALRM} = sub {exit 1};
+    alarm 300;
+    while (my $line = <STDIN>) {
+        debug_print('PUT', $line);
+        $line =~ s/\s*\r?\n$//;
+        #TODO: size limit?  compression?
+        my %op = split(/[= ]+/, $line);
+        # ignore malformed lines with undefined op values
+        next if (grep(!/./, values %op));
+        next if (defined $op{doing} && ($op{doing} < $meta{$opts{doing}} ||
+                $op{doing} >= $doing_size));
+        if (defined $op{doing}) {
+            $fhs{doing}->seek($op{doing}, 0);
+            my $done;
+            $fhs{doing}->read($done, 1);
+            # skip processing if this operation has been timed out
+            next if ($done ne ' ');
+            # indicate that operation has been seen
+            $fhs{doing}->seek($op{doing}, 0);
+            $fhs{doing}->print($opts{meta_pack});
+        }
+
+        my @args = split(/,/, $op{args});
+        my $cmd = shift @args;
+        my ($sid, $split) = split(/:/, $op{split});
+
+        if ($cmd =~ /^ckattr/ && defined $op{state}) {
+            $meta{s_run} -= $op{size};
+            $meta{t_run}--;
+            if ($op{state} eq 'error') {
+                # dst does not exist so next state is cp
+                $cmd = "cp";
+            } else {
+                if (defined $op{split}) {
+                    # record all split copies done
+                    $meta{"sd_cp_$sid"}->bnot;
+                    $meta{"st_cp_$sid"} = 0;
+                    if ($op{state} eq 'done') {
+                        # record all split sums and cksums done
+                        $meta{"sd_sum_$sid"}->bnot;
+                        $meta{"st_sum_$sid"} = 0;
+                        $meta{"sd_cksum_$sid"}->bnot;
+                        $meta{"st_cksum_$sid"} = 0;
+                    }
+                }
+                # record copy done
+                $meta{s_cp} += $op{size};
+                $meta{d_cp}++;
+                if ($op{state} eq 'done') {
+                    # record sum and cksum done
+                    $meta{s_sum} += $op{size};
+                    $meta{s_cksum} += $op{size};
+                    $meta{d_sum}++;
+                    $meta{d_cksum}++;
+                    # dst exists with same attrs so next state is chattr
+                    $cmd = "chattr";
+                    # do not create partial operations for chattr
+                    delete $op{split} if (defined $op{split});
+                } else {
+                    # dst exists with diff/ignored attrs so next state is sum
+                    $cmd = "sum";
+                }
+            }
+            $op{args} =~ s/^[^,]+/$cmd/;
+            # more work to be done
+            delete $op{$_} foreach (qw(doing rate run state text time));
+            $line = join(" ", map {"$_=$op{$_}"} sort(keys %op));
+            if (defined $op{split}) {
+                my $pos = 0;
+                my $split = 0;
+                while ($pos < $op{size}) {
+                    # create a partial operation for each split
+                    my $end = min($pos + $meta{split}, $op{size});
+                    # adjust size
+                    my $size = $end - $pos;
+                    $line =~ s/size=\d+/size=$size/;
+                    $line =~ s/split=\S+/split=$sid:$split/;
+                    $fhs{do}->print("$line bytes=$pos-$end\n");
+                    $split++;
+                    $pos += $meta{split};
+                }
+            } else {
+                $fhs{do}->print("$line\n");
+            }
+        } elsif ($cmd eq 'last') {
+            $meta{last} = 1;
+            $fhs{tree}->flush;
+            $meta{rtree} = ($fhs{tree}->stat)[7];
+        } elsif ($cmd eq 'tar_last') {
+            $meta{tar_last_file} = $args[0];
+            $meta{tar_last_size} = $op{size};
+            if ($args[0] =~ /-1\.tar/) {
+                $meta{tar_mv} = 1;
+                # use chattr to track additional move
+                $meta{t_chattr}++;
+            }
+        } elsif ($cmd eq 'load') {
+            # record host load for throttling
+            $meta{"load_$opts{host}"} = $line;
+        } elsif ($cmd eq 'getopt') {
+            # initialize transfer settings once all getopt lines received
+            init_id() if ($args[0] eq 'end');
+            # check validity of option
+            next if ($args[0] !~ /^(?:check|clients|command|cpu|create-tar|cron|cwd|disk|encrypt|exception|extract-tar|files|host-list|hosts|index-tar|io|local|mail|net|offline|preserve|remote|retry|size|split|split-tar|stripe|verify|verify-fast|version)$/);
+            if ($args[0] eq 'exception') {
+                # track exceptions for stats processing
+                $meta{e_exception}++;
+            }
+            $args[0] .= "_$opts{host}$opts{cid}"
+                if ($args[0] =~ /(?:exception|version)$/);
+            $meta{$args[0]} = defined $op{text} ? unescape($op{text}) : 1;
+        } elsif ($cmd eq 'host') {
+            # host error so remove host from outstanding hosts
+            $meta{ohosts}--;
+            delete $meta{"host_$args[0]"};
+            $meta{"nohost_$args[0]"} = 1;
+        } elsif ($op{state} eq 'done') {
+            $meta{"warn_$opts{host}$opts{cid}"} = 0;
+            $fhs{done}->print("$line\n");
+            $meta{s_run} -= $op{size};
+            $meta{"s_$cmd"} += $op{size};
+            $meta{t_run}--;
+            if (defined $op{split}) {
+                my $test = Math::BigInt->new(1);
+                $test->blsft($split);
+                if ($test->copy->band($meta{"sd_$cmd\_$sid"})->is_zero) {
+                    # record that this particular split was done;
+                    $meta{"sd_$cmd\_$sid"}->bior($test);
+                    # decrement number of splits that need to be done;
+                    $meta{"st_$cmd\_$sid"}--;
+                }
+            }
+            if (!defined $op{split} || $meta{"st_$cmd\_$sid"} <= 0) {
+                # only update cp totals for unsplit files or last split
+                $meta{"d_$cmd"}++;
+                $meta{"d_$op{tool}"}++;
+            }
+            if ($meta{verify} && $cmd eq 'cp') {
+                if ($op{hash}) {
+                    # transport already summed so next state is cksum
+                    $cmd = "cksum";
+                    $op{args} =~ s/^[^,]+/$cmd/;
+                    if (defined $op{split}) {
+                        my $test = Math::BigInt->new(1);
+                        $test->blsft($split);
+                        if ($test->copy->band($meta{"sd_sum_$sid"})->is_zero) {
+                            # record that this particular split was done;
+                            $meta{"sd_sum_$sid"}->bior($test);
+                            # decrement number of splits that need to be done;
+                            $meta{"st_sum_$sid"}--;
+                        }
+                    }
+                    if (!defined $op{split} || $meta{"st_sum_$sid"} <= 0) {
+                        # only update sum totals for unsplit files or last split
+                        $meta{d_sum}++;
+                    }
+                    $meta{s_sum} += $op{size};
+                } else {
+                    # next state is sum
+                    $cmd = "sum";
+                    $op{args} =~ s/^[^,]+/$cmd/;
+                }
+            } elsif ($meta{verify} && $cmd eq 'sum') {
+                # next state is cksum
+                $cmd = "cksum";
+                $op{args} =~ s/^[^,]+/$cmd/;
+            } elsif (($meta{check} || $meta{preserve}) &&
+                    $cmd =~ /^(?:cksum|cp|ln)/) {
+                if (!defined $op{split} ||
+                        $cmd eq 'cksum' && $meta{"st_cksum_$sid"} <= 0 ||
+                        $cmd eq 'cp' && $meta{"st_cp_$sid"} <= 0) {
+                    # indicate operation was ln so can handle differently
+                    $op{ln} = 1 if ($cmd eq 'ln');
+                    # only chattr unsplit files or last split
+                    # next state is chattr
+                    $cmd = "chattr";
+                    $op{args} =~ s/^[^,]+/$cmd/;
+                    delete $op{bytes};
+                    delete $op{hash};
+                    delete $op{split};
+                } else {
+                    # ignore splits before last split
+                    next;
+                }
+            } else {
+                $meta{time1} = $time if ($meta{last} && !run());
+                next;
+            }
+            # more work to be done
+            delete $op{$_} foreach (qw(doing rate run state text time));
+            $line = join(" ", map {"$_=$op{$_}"} sort(keys %op));
+            $fhs{do}->print("$line\n");
+        } elsif ($op{state} && $op{try} >= $meta{retry}) {
+            $meta{"warn_$opts{host}$opts{cid}"} = 0;
+            $fhs{error}->print("$line\n");
+            $meta{t_run}--;
+            $meta{s_run} -= $op{size};
+            $meta{s_error} += $op{size};
+            $meta{"e_$cmd"}++;
+            $meta{"e_$op{tool}"}++;
+            $meta{time1} = $time if ($meta{last} && !run());
+        } elsif ($op{state}) {
+            $meta{s_run} -= $op{size};
+            $meta{t_run}--;
+            $op{try}++;
+            if ($cmd eq 'chattr' &&
+                    unescape($op{text}) =~ /file sizes differ$/) {
+                # track corruption for stats processing
+                $meta{e_corruption}++;
+                # reset size since may have changed during chattr split join
+                $op{size} = (split(/,/, $op{attrs}))[7];
+                # file corrupted so next state is cp
+                $cmd = "cp";
+                $op{args} =~ s/^[^,]+/$cmd/;
+                # mark operations as not done
+                $meta{d_cp}--;
+                $meta{s_cp} -= $op{size};
+                if ($meta{verify}) {
+                    $meta{d_sum}--;
+                    $meta{d_cksum}--;
+                    $meta{s_sum} -= $op{size};
+                    $meta{s_cksum} -= $op{size};
+                }
+                if ($meta{split} > 0 && $op{size} > $meta{split}) {
+                    $op{state} = "warn";
+                    # more work to be done
+                    delete $op{$_} foreach (qw(doing rate run time));
+                    $line = join(" ", map {"$_=$op{$_}"} sort(keys %op));
+                    my ($x1, $x2) = (0, $op{size});
+                    # bytes must be subset of existing tar bytes range
+                    ($x1, $x2) = ($1, $2) if ($op{tar_bytes} =~ /(\d+)-(\d+)/);
+                    my $split = 0;
+                    while ($x1 < $x2) {
+                        $meta{w_run}++;
+                        # create a partial copy operation for each split
+                        my $end = min($x1 + $meta{split}, $x2);
+                        # adjust size
+                        my $size = $end - $x1;
+                        $line =~ s/size=\d+/size=$size/;
+                        $fhs{do}->print("$line split=$meta{split_id}:$split bytes=$x1-$end\n");
+                        $split++;
+                        $x1 += $meta{split};
+                    }
+                    # use new split id (old one lost during chattr stage)
+                    foreach ($meta{verify} ? qw(cp sum cksum) : qw(cp)) {
+                        $meta{t_split} += $split;
+                        $meta{"st_$_\_$meta{split_id}"} = $split;
+                        $meta{"sd_$_\_$meta{split_id}"} = Math::BigInt->new(0);
+                    }
+                    $meta{split_id}++;
+                    next;
+                }
+            } elsif ($cmd eq 'cksum' &&
+                    unescape($op{text}) =~ /^Corruption,?(.*\d)?/) {
+                my $bytes = $1;
+                # track corruption for stats processing
+                $meta{e_corruption}++;
+                $meta{s_cksum} += $op{size};
+                if ($bytes) {
+                    my $size = (split(/,/, $op{attrs}))[7];
+                    my $slice = 1073741824;
+                    $slice = min($slice, $meta{split}) if ($meta{split} > 0);
+                    if (defined $size) {
+                        # adjust ranges to sane values
+                        my @ranges = split(/,/, $bytes);;
+                        foreach my $range (@ranges) {
+                            my ($x1, $x2) = split(/-/, $range);
+                            # truncate dst
+                            $range = "$x1-$size"
+                                if ($x2 >= $size || $x2 - $x1 < $slice);
+                        }
+                        $bytes = join(",", @ranges);
+                    }
+                    # reduce tries if progress being made
+                    $op{try}-- if ($op{bytes} ne $bytes);
+                    $op{bytes} = $bytes;
+                    # adjust size of remaining operations
+                    $op{size} = 0;
+                    foreach (split(/,/, $bytes)) {
+                        $op{size} += $2 - $1 if (/(\d+)-(\d+)/);
+                    }
+                }
+
+                if (defined $op{split}) {
+                    my $test = Math::BigInt->new(1);
+                    $test->blsft($split);
+                    $test->bnot;
+                    foreach (qw(cp sum)) {
+                        # record that this particular split was not done;
+                        $meta{"sd_$_\_$sid"}->band($test);
+                        # increment number of splits that need to be done;
+                        $meta{"st_$_\_$sid"}++;
+                        $meta{"d_$_"}-- if ($meta{"st_$_\_$sid"} == 1);
+                    }
+                } else {
+                    $meta{d_cp}--;
+                    $meta{d_sum}--;
+                }
+
+                # file corrupted so next state is cp
+                $cmd = "cp";
+                $op{args} =~ s/^[^,]+/$cmd/;
+                # reduce sizes by amount of file that was corrupt
+                $meta{s_cp} -= $op{size};
+                $meta{s_sum} -= $op{size};
+                $meta{s_cksum} -= $op{size};
+            } elsif ($meta{"warn_$opts{host}$opts{cid}"}) {
+                $meta{"warn_$opts{host}$opts{cid}"} = 1;
+            }
+            $op{state} = "warn";
+            $meta{w_run}++;
+            # more work to be done
+            delete $op{$_} foreach (qw(doing rate run time));
+            # do not delete hash when retrying cksum
+            delete $op{hash} if ($op{args} !~ /^cksum/);
+            $line = join(" ", map {"$_=$op{$_}"} sort(keys %op));
+            $fhs{do}->print("$line\n");
+        } elsif (defined $op{size}) {
+            $meta{"t_$cmd"}++;
+            $meta{t_chattr}++ if ($meta{check} || $meta{preserve});
+            if ($cmd eq 'mkdir') {
+                $fhs{tree}->print("$line\n");
+            } elsif ($cmd eq 'cp') {
+                $meta{s_total} += $op{size};
+                if ($meta{verify}) {
+                    $meta{t_sum}++;
+                    $meta{t_cksum}++;
+                }
+                if ($meta{split} > 0 && $op{size} > $meta{split}) {
+                    my ($x1, $x2) = (0, $op{size});
+                    # bytes must be subset of existing tar bytes range
+                    ($x1, $x2) = ($1, $2) if ($op{bytes} =~ /(\d+)-(\d+)/);
+                    my $split = 0;
+                    while ($x1 < $x2) {
+                        # create a partial copy operation for each split
+                        my $end = min($x1 + $meta{split}, $x2);
+                        # adjust size
+                        my $size = $end - $x1;
+                        $line =~ s/size=\d+/size=$size/;
+                        $line =~ s/ bytes=\S+//;
+                        $fhs{do}->print("$line split=$meta{split_id}:$split bytes=$x1-$end\n");
+                        $split++;
+                        $x1 += $meta{split};
+                    }
+                    foreach ($meta{verify} ? qw(cp sum cksum) : qw(cp)) {
+                        $meta{t_split} += $split;
+                        $meta{"st_$_\_$meta{split_id}"} = $split;
+                        $meta{"sd_$_\_$meta{split_id}"} = Math::BigInt->new(0);
+                    }
+                    $meta{split_id}++;
+                } else {
+                    $fhs{do}->print("$line\n");
+                }
+            } else {
+                if ($cmd =~ /^ckattr/) {
+                    $meta{sync} = 1;
+                    # create additional operations without adding to logs
+                    $meta{"t_$_"}++ foreach (qw(cp sum cksum));
+                    $meta{s_total} += $op{size};
+                    if ($meta{split} > 0 && $op{size} > $meta{split}) {
+                        my $split = ceil($op{size} / $meta{split});
+                        foreach (qw(cp sum cksum)) {
+                            $meta{t_split} += $split;
+                            $meta{"st_$_\_$meta{split_id}"} = $split;
+                            $meta{"sd_$_\_$meta{split_id}"} = Math::BigInt->new(0);
+                        }
+                        # record split info for result processing
+                        $line .= " split=$meta{split_id}:$split";
+                        $meta{split_id}++;
+                    }
+                }
+                $fhs{do}->print("$line\n");
+            }
+        } elsif ($cmd eq 'mount') {
+            $mnts{"mount_$op{host}:$op{local}"} = $line;
+        } elsif ($cmd eq 'shell') {
+            $mnts{"shell_$op{host}"} = $op{pbs} ? "pbs" : 1;
+        }
+    }
+    alarm 0;
+
+    # close log files
+    $fhs{$_}->close foreach (keys %fhs);
+
+    # update user db
+    if (scalar(keys %mnts) > 0) {
+        # retrieve global database from file
+        eval {
+            local $SIG{__WARN__} = sub {die};
+            %db = %{retrieve($conf{db_file})};
+        };
+        if ($@) {
+            # database could not be opened
+            %db = ();
+        }
+
+        # retrieve user database from file
+        eval {
+            local $SIG{__WARN__} = sub {die};
+            %udb = %{retrieve($conf{udb_file})};
+        };
+        if ($@) {
+            # database could not be opened
+            %udb = ();
+        }
+
+        my $store;
+        while (my ($key, $val) = each %mnts) {
+            if ($key =~ /^shell_/) {
+                # only add hosts that are not in global db
+                next if ($db{$key});
+                if ($val eq 'pbs') {
+                    $meta{$key} = 1;
+                } else {
+                    $udb{$key} = 1;
+                    $store = 1;
+                }
+                next;
+            }
+
+            # eliminate any random double slashes that crept in
+            $val =~ s/\/\//\//g;
+            my %mnt = split(/[= ]+/, $val);
+            # only add hosts that are not in global db
+            next if ($db{"shell_$mnt{host}"});
+            if ($mnts{"shell_$mnt{host}"} eq 'pbs') {
+                $meta{$key} = $val;
+            } else {
+                $udb{$key} = $val;
+                $store = 1;
+            }
+
+            # add implicit mounts
+            foreach my $srv (split(/,/, $mnt{servers})) {
+                my %imnt = %mnt;
+                $imnt{local} = $imnt{remote};
+                $imnt{host} = $srv;
+                $imnt{servers} = $srv;
+                $udb{"mount_$srv:$imnt{remote}"} =
+                    join(" ", map {"$_=$imnt{$_}"} sort(keys %imnt));
+                $store = 1;
+            }
+        }
+
+        if ($store) {
+            # store user db to file
+            nstore(\%udb, $conf{udb_file});
+
+            # synchronize user db
+            if ($conf{sync_hook}) {
+                my $cmd = $conf{sync_hook};
+                # replace %d with base user directory
+                $cmd =~ s/%d/$conf{user_dir}/g;
+                # replace %f with user db file
+                $cmd =~ s/%f/$opts{user}.db/g;
+                system($cmd);
+            }
+        }
+    }
+}
+
+##################
+#### put_meta ####
+##################
+# begin metadata line or save given metadata and end line
+sub put_meta {
+    my $meta = shift;
+    my $file = "$opts{base}/meta";
+    open(FILE, '>>', $file);
+    if (defined $meta) {
+        print FILE encode_base64(compress(nfreeze($meta)), ""), "]\n";
+    } else {
+        print FILE "[";
+    }
+    close FILE;
+    #TODO: handle errors;
+}
+
+#############
+#### run ####
+#############
+# return whether or not the current transfer is running
+sub run {
+    my $expect;
+    $expect += $meta{"t_$_"} foreach (qw(cp ln mkdir));
+    $expect += $meta{tar_mv};
+    if ($meta{verify} && ($meta{check} || $meta{preserve})) {
+        # expect sums for done cps and cksums for done sums
+        $expect += $meta{"d_$_"} foreach (qw(cp sum));
+        # expect file chattrs for done cksums and done lns
+        $expect += $meta{d_cksum} + $meta{d_ln};
+        # expect dir chattrs only when no other errors
+        my $errs = sum(map {$meta{"e_$_"}} qw(chattr cksum cp ln mkdir sum));
+        $expect += $errs ? 0 : $meta{t_mkdir};
+    } elsif ($meta{verify}) {
+        # expect sums for done cps and cksums for done sums
+        $expect += $meta{"d_$_"} foreach (qw(cp sum));
+    } elsif ($meta{check} || $meta{preserve}) {
+        # expect file chattrs for done cps and done lns
+        $expect += $meta{d_cp} + $meta{d_ln};
+        # expect dir chattrs only when no other errors
+        my $errs = sum(map {$meta{"e_$_"}} qw(chattr cp ln mkdir));
+        # when errs > 0 and rtree == 0, any chattr errors are from dirs
+        # and not files, so should still expect t_mkdir dir chattrs
+        $expect += $errs && $meta{rtree} ? 0 : $meta{t_mkdir};
+    }
+    my $actual = sum(map {$meta{"d_$_"}} qw(chattr cksum cp ln mkdir sum));
+    $actual += sum(map {$meta{"e_$_"}} qw(chattr cksum cp ln mkdir sum));
+    # running if actual operations differ from expected operations
+    return ($expect != $actual);
+}
+
+###############
+#### stats ####
+###############
+# output table of consolidated stats across all transfers of invoking
+# user or all users if invoked as root
+sub stats {
+    my $all;
+    my %heads;
+    my %types;
+    my %users;
+
+    # define headers for each table type
+    $heads{Transfers} =
+        [qw(xfers local lan wan dirs files size sums ssize attrs hosts)];
+    $heads{Rates} =
+        [qw(local_min local_max local_avg lan_min lan_max lan_avg wan_min
+            wan_max wan_avg all_min all_max all_avg)];
+    $heads{Tools} =
+        [qw(bbftp fish mcp msum rsync sftp shiftc shift-aux)];
+    $heads{Options_1} =
+        [qw(clients cpu create-tar disk encrypt extract-tar files host-list
+            hosts index-tar io local net no-check)];
+    $heads{Options_2} =
+        [qw(no-cron no-offline no-mail no-preserve remote retry size split
+            split-tar stripe sync verify verify-fast)];
+    $heads{Errors} =
+        [qw(corruption exception chattr cksum cp host ln mkdir sum)];
+
+    # define order in output
+    my @order = qw(Transfers Rates Tools Options_1 Options_2 Errors);
+
+    # add tool errors
+    push(@{$heads{Errors}}, @{$heads{Tools}});
+    $_ = "e_$_" foreach (@{$heads{Errors}});
+    $_ = "o_$_" foreach (@{$heads{Options_1}}, @{$heads{Options_2}});
+
+    if (!$opts{user} && $> == 0) {
+        # replace %u with * to get stats from all users
+        $conf{user_dir} =~ s/%u/*/g;
+    } else {
+        $opts{user} = getpwuid($<) if (!$opts{user});
+        $conf{user_dir} =~ s/%u/$opts{user}/g;
+    }
+
+    # compute totals over all transfers
+    foreach my $file (glob "$conf{user_dir}/*/meta") {
+        # skip transfers that have expired
+        my $mtime = (stat($file))[9];
+        next if ($mtime + $conf{data_expire} < $time);
+
+        # retrieve metadata from file
+        my %meta = %{get_meta($file)};
+
+        # derive transfer type
+        my $type = "local";
+        my @args = split(/\s+/, $meta{command});
+        if ($meta{origin} =~ /\Q$conf{email_domain}\E$/ &&
+                grep(/^pick_/, keys %meta)) {
+            # original client host is in local domain and remote host picked
+            $type = "lan";
+        } elsif ($meta{origin} !~ /\Q$conf{email_domain}\E$/) {
+            # original client host is not in local domain
+            $type = "wan";
+        }
+
+        # derive user from meta file
+        my $user = $file;
+        $user =~ s/.*\/(\w+)\.\d+\/meta/$1/;
+
+        foreach (qw(e_corruption e_exception)) {
+            # add corruption/exception totals even when transfer not completed
+            $all->{$_} += $meta{$_};
+            $users{$user}->{$_} += $meta{$_};
+            $types{$type}->{$_} += $meta{$_};
+        }
+
+        # skip transfers that have not completed
+        next if (!$meta{time1});
+        my %totals;
+
+        # transfer totals
+        $totals{attrs} = $meta{d_chattr};
+        $totals{hosts} = grep(/^last_/, keys %meta);
+        $totals{dirs} = $meta{d_mkdir};
+        $totals{files} = $meta{d_cp} + $meta{d_ln};
+        $totals{size} = $meta{s_cp};
+        $totals{ssize} = $meta{s_sum} + $meta{s_cksum};
+        $totals{sums} = $meta{d_sum} + $meta{d_cksum};
+        $totals{xfers} = 1;
+        $totals{$type} = 1;
+
+        # tool operation totals and tool error totals
+        foreach (@{$heads{Tools}}) {
+            $totals{$_} = $meta{"d_$_"};
+            $totals{"e_$_"} = $meta{"e_$_"};
+        }
+
+        # option totals
+        # options that must differ from configured default
+        foreach my $key (qw(clients cpu disk files hosts io net retry size
+                            split stripe)) {
+            my $default = $conf{"default_$key"};
+            if ($default =~ /^([1-9]\d*)([kmgt])?$/i) {
+                my $unit = defined $2 ? $2 : '';
+                $default = $1 * $bytes{uc $unit};
+            }
+            $totals{"o_$key"} = defined $meta{$key} &&
+                $meta{$key} ne $default ? 1 : 0;
+        }
+        # options that must be inverted
+        foreach (qw(check cron mail offline preserve)) {
+            $totals{"o_no-$_"} = !$meta{$_} ? 1 : 0;
+        }
+        # normal options
+        foreach (qw(create-tar encrypt extract-tar host-list index-tar local
+                    remote split-tar sync verify verify-fast wait)) {
+            $totals{"o_$_"} = $meta{$_} ? 1 : 0;
+        }
+
+        # error totals (corruption and exception handled earlier)
+        foreach (qw(chattr cksum cp ln mkdir sum)) {
+            $totals{"e_$_"} = $meta{"e_$_"};
+        }
+        $totals{e_host} = grep(/^nohost_/, keys %meta);
+
+        # add transfer stats to totals per user, per type, and overall
+        foreach my $head (keys %heads) {
+            # rates must be processed differently
+            next if ($head eq 'Rates');
+            foreach my $key (@{$heads{$head}}) {
+                $all->{$key} += $totals{$key};
+                $users{$user}->{$key} += $totals{$key};
+                $types{$type}->{$key} += $totals{$key};
+            }
+        }
+
+        # compute rate for this transfer
+        my $dtime = $meta{time1} - $meta{time0};
+        $dtime = 1 if ($dtime <= 0);
+        my $rate = $meta{s_cp} / $dtime;
+        # ignore rates of zero
+        next if (!$rate);
+
+        # compute rates per user, per type, and overall
+        foreach my $ref ($users{$user}, $types{$type}, $all) {
+            $ref->{"$type\_max"} = max($rate, $ref->{"$type\_max"});
+            $ref->{"$type\_min"} = $ref->{"$type\_min"} ?
+                min($rate, $ref->{"$type\_min"}) : $rate;
+            $ref->{all_max} = max($rate, $ref->{all_max});
+            $ref->{all_min} =
+                $ref->{all_min} ? min($rate, $ref->{all_min}) : $rate;
+            # cumulative moving averages
+            $ref->{"$type\_avg"} +=
+                (($rate - $ref->{"$type\_avg"}) / $ref->{$type});
+            $ref->{all_avg} += (($rate - $ref->{all_avg}) / $ref->{xfers});
+        }
+    }
+
+    # convert rates to human readable format
+    foreach my $rate (@{$heads{Rates}}) {
+        $all->{$rate} = format_bytes($all->{$rate}) . "/s"
+            if ($all->{$rate});
+        foreach my $user (keys %users) {
+            $users{$user}->{$rate} = format_bytes($users{$user}->{$rate}) . "/s"
+                if ($users{$user}->{$rate});
+        }
+        foreach my $type (keys %types) {
+            $types{$type}->{$rate} = format_bytes($types{$type}->{$rate}) . "/s"
+                if ($types{$type}->{$rate});
+        }
+    }
+
+    # convert sizes to human readable format
+    foreach my $size (qw(size ssize)) {
+        $all->{$size} = format_bytes($all->{$size});
+        foreach my $user (keys %users) {
+            $users{$user}->{$size} = format_bytes($users{$user}->{$size});
+        }
+        foreach my $type (keys %types) {
+            $types{$type}->{$size} = format_bytes($types{$type}->{$size});
+        }
+    }
+
+    # compute start and end dates
+    my $date1 = strftime('%m/%d/%y', localtime($time - $conf{data_expire}));
+    my $date2 = strftime('%m/%d/%y', localtime);
+
+    # print tables
+    foreach my $head (@order) {
+        my @heads = @{$heads{$head}};
+        print "$head per user ($date1 - $date2)\n\n";
+
+        # configure table headers
+        my $t = Text::FormatTable->new("r" . " | r" x scalar(@heads));
+        $t->head("user", map {/^\w_/ ? substr($_, 2) : $_} @heads);
+        $t->rule;
+
+        # add row for each user
+        foreach my $user (sort keys(%users)) {
+            $t->row($user, map {$users{$user}->{$_} || ""} @heads);
+        }
+
+        # add separator between user and type rows
+        $t->rule;
+
+        # add row for each transfer type
+        foreach my $type (qw(local lan wan)) {
+            $t->row($type, map {$types{$type}->{$_} || ""} @heads);
+        }
+        # add overall totals
+        $t->row("all (" . scalar(keys %users) . ")",
+            map {$all->{$_} || ""} @heads);
+
+        # output final table
+        print $t->render, "\n\n";
+    }
+
+    # print error message table
+    print "Error messages per user ($date1 - $date2)\n\n";
+    # configure table headers
+    my $t = Text::FormatTable->new("r | r | l | l");
+    $t->head(qw(user id op target));
+    $t->head("", "", "tool", "message");
+    $t->rule;
+    my $ulast;
+    foreach my $file (glob "$conf{user_dir}/*/meta") {
+        # skip transfers that have expired
+        my $mtime = (stat($file))[9];
+        next if ($mtime + $conf{data_expire} < $time);
+
+        # retrieve metadata from file
+        my %meta = %{get_meta($file)};
+
+        # skip transfers without errors
+        next if (!$meta{error_size} && !$meta{e_exception});
+
+        # derive user and id from meta file
+        my ($user, $id);
+        if ($file =~ /.*\/(\w+)\.(\d+)\/meta/) {
+            ($user, $id) = ($1, $2);
+        } else {
+            next;
+        }
+
+        my $count;
+        # add all exceptions stored in metadata
+        if ($meta{e_exception}) {
+            foreach my $ex (grep(/^exception_/, keys %meta)) {
+                # separate different users with line
+                $t->rule if ($ulast && $user ne $ulast);
+                # only print user and id once to reduce clutter
+                $t->row($user ne $ulast ? $user : "",
+                    !$count ? $id : "", "-", $ex);
+                $t->row("", "", "shiftc", unescape($meta{$ex}));
+                $count++;
+                $ulast = $user;
+            }
+        }
+
+        # add up to three error messages stored in error file
+        $file =~ s/meta$/error/;
+        if (open(FILE, '<', $file)) {
+            # separate different users with line
+            $t->rule if ($ulast && $user ne $ulast);
+            foreach (1..3) {
+                my $line = <FILE>;
+                last if (!$line);
+                $line =~ s/\s*\r?\n$//;
+                my %op = split(/[= ]+/, $line);
+                my @args = split(/,/, $op{args});
+                # only print user and id once to reduce clutter
+                $t->row($user ne $ulast ? $user : "",
+                    !$count ? $id : "", $args[0], unescape($args[-1]));
+                $t->row("", "", $op{tool}, unescape($op{text}));
+                $count++;
+                $ulast = $user;
+            }
+            close FILE;
+        }
+    }
+    # output final table
+    print $t->render;
+}
+
+################
+#### status ####
+################
+# output table of all transfers with status and statistics or
+# return single row when manager invoked with id option
+sub status {
+    # configure table headers
+    my $t = Text::FormatTable->new('r | l | r | r | r | r | r | r');
+    my @row = (qw(id state dirs files), "file size", qw(date length rate));
+    my @row2 = ("", "", "sums", "attrs", "sum size", "time", "", "");
+    if ($opts{status} eq 'csv') {
+        print join(",", @row, @row2), "\n";
+    } else {
+        $t->head(@row);
+        $t->head(@row2);
+        $t->rule;
+    }
+
+    # sort by modification time of meta file
+    foreach my $file (sort {(stat $a)[9] <=> (stat $b)[9]}
+            glob "$conf{user_dir}/$opts{user}.*/meta") {
+        my $id = $file;
+        $id =~ s/.*\.|\/meta//g;
+        if ($opts{id}) {
+            # ignore other ids when id is defined
+            next if ($id != $opts{id});
+        } else {
+            # retrieve metadata from file
+            %meta = %{get_meta($file)};
+        }
+        my $time1 = defined $meta{time1} ? $meta{time1} : $time;
+        my $state = "run";
+        # compute number of operations in various states
+        my $done = sum(map {$meta{"d_$_"}} qw(chattr cksum cp ln mkdir sum));
+        my $error = sum(map {$meta{"e_$_"}} qw(chattr cksum cp ln mkdir sum));
+        my $total = sum(map {$meta{"t_$_"}} qw(chattr cksum cp ln mkdir sum));
+        # determine transfer state
+        if (defined $meta{time1} && $done == $total) {
+            $state = "done";
+        } elsif ($meta{stop}) {
+            $state = "stop";
+        } elsif ($meta{time1} || $meta{e_mkdir}) {
+            $state = "error";
+        } else {
+            $state .= "+warn" if ($meta{w_run} > 0);
+            $state .= "+error" if ($error > 0);
+        }
+        # add first row for each transfer with bulk of information
+        my @row = ($id, $state,
+            "$meta{d_mkdir}/" . ($meta{last} ? $meta{t_mkdir} : "-"),
+            $meta{d_cp} + $meta{d_ln} . "/" .
+                ($meta{last} ? $meta{t_cp} + $meta{t_ln} : "-"),
+            format_bytes($meta{s_cp}) . "/" .
+                ($meta{last} ? format_bytes($meta{s_total}) : "-"),
+            strftime('%m/%d', localtime($meta{time0})),
+            format_seconds($time1 - $meta{time0}),
+            format_bytes($time1 - $meta{time0} ?
+                $meta{s_cp} / ($time1 - $meta{time0}) : $meta{s_cp}) . "/s");
+        my $s_total = $meta{verify} ? 2 * $meta{s_total} : 0;
+        # add second row for each transfer with sums, attrs and sum size
+        @row2 = ("", "",
+            $meta{d_sum} + $meta{d_cksum} . "/" .
+                ($meta{last} ? $meta{t_sum} + $meta{t_cksum} : "-"),
+            "$meta{d_chattr}/" . ($meta{last} ? $meta{t_chattr} : "-"),
+            format_bytes($meta{s_sum} + $meta{s_cksum}) . "/" .
+                ($meta{last} ? format_bytes($s_total) : "-"),
+            strftime('%R', localtime($meta{time0})), "", "");
+        if ($opts{status} eq 'csv') {
+            print join(",", @row, @row2), "\n";
+        } else {
+            $t->row(@row);
+            $t->row(@row2);
+        }
+    }
+    if ($opts{status} ne 'csv') {
+        # return/output final table depending on id option
+        $opts{id} ? return $t->render : print $t->render;
+    }
+}
+
+
+###########################
+#### Text::FormatTable ####
+###########################
+# Copyright (c) 2001-2004 Swiss Federal Institute of Technology, Zurich.
+#           (c) 2009 Trey Harris
+# License: Perl Artistic License
+package Text::FormatTable;
+
+use Carp;
+use strict;
+use warnings;
+use vars qw($VERSION);
+
+$VERSION = '1.03';
+
+# Remove ANSI color sequences when calculating length
+sub _uncolorized_length($)
+{
+    my $str = shift;
+    $str =~ s/\e \[ [^m]* m//xmsg;
+    return length $str;
+}
+
+# minimal width of $1 if word-wrapped
+sub _min_width($)
+{
+    my $str = shift;
+    my $min;
+    for my $s (split(/\s+/,$str)) {
+        my $l = _uncolorized_length $s;
+        $min = $l if not defined $min or $l > $min;
+    }
+    return $min ? $min : 1;
+}
+
+# width of $1 if not word-wrapped
+sub _max_width($)
+{
+    my $str = shift;
+    my $len = _uncolorized_length $str;
+    return $len ? $len : 1;
+}
+
+sub _max($$)
+{
+    my ($a,$b) = @_;
+    return $a if defined $a and (not defined $b or $a >= $b);
+    return $b;
+}
+
+# word-wrap multi-line $2 with width $1
+sub _wrap($$)
+{
+    my ($width, $text) = @_;
+    my @lines = split(/\n/, $text);
+    my @w = ();
+    for my $l (@lines) {
+        push @w, @{_wrap_line($width, $l)};
+    }
+    return \@w;
+}
+
+sub _wrap_line($$)
+{
+    my ($width, $text) = @_;
+    my $width_m1 = $width-1;
+    my @t = ($text);
+    while(1) {
+        my $t = pop @t;
+        my $l = _uncolorized_length $t;
+        if($l <= $width){
+            # last line is ok => done
+            push @t, $t;
+            return \@t;
+        }
+        elsif($t =~ /^(.{0,$width_m1}\S)\s+(\S.*?)$/) {
+            # farest space < width
+            push @t, $1;
+            push @t, $2;
+        }
+        elsif($t =~ /(.{$width,}?\S)\s+(\S.*?)$/) {
+            # nearest space > width
+            if ( _uncolorized_length $1 > $width_m1  )
+            {
+                # hard hyphanation 
+                my $left = substr($1,0,$width);
+                my $right= substr($1,$width);
+
+                push @t, $left;
+                push @t, $right;
+                push @t, $2;
+            }
+            else
+            {
+                push @t, $1;
+                push @t, $2;
+            }
+        }
+        else {
+            # hard hyphanation 
+            my $left = substr($t,0,$width);
+            my $right= substr($t,$width);
+
+            push @t, $left;
+            push @t, $right;
+            return \@t;
+        }
+    }
+    return \@t;
+}
+
+# render left-box $2 with width $1
+sub _l_box($$)
+{
+    my ($width, $text) = @_;
+    my $lines = _wrap($width, $text);
+    map { $_ .= ' 'x($width-_uncolorized_length($_)) } @$lines;
+    return $lines;
+}
+
+# render right-box $2 with width $1
+sub _r_box($$)
+{
+    my ($width, $text) = @_;
+    my $lines = _wrap($width, $text);
+    map { $_ = (' 'x($width-_uncolorized_length($_)).$_) } @$lines;
+    return $lines;
+}
+
+# Algorithm of:
+# http://ei5nazha.yz.yamagata-u.ac.jp/~aito/w3m/eng/STORY.html
+
+sub _distribution_f($)
+{
+    my $max_width = shift;
+    return log($max_width);
+}
+
+sub _calculate_widths($$)
+{
+    my ($self, $width) = @_;
+    my @widths = ();
+    # calculate min and max widths for each column
+    for my $r (@{$self->{data}})
+    {
+        $r->[0] eq 'data' or $r->[0] eq 'head' or next;
+        my $cn=0;
+        my ($max, $min) = (0,0);
+        
+        for my $c (@{$r->[1]}) {
+            
+            if ( $self->{fixed_widths}[$cn] )
+            {
+               # fixed width
+               $widths[$cn][0] = $self->{fixed_widths}[$cn]; 
+               $widths[$cn][1] = $self->{fixed_widths}[$cn];
+            }
+            else
+            {
+                $widths[$cn][0] = _max($widths[$cn][0], _min_width $c);
+                $widths[$cn][1] = _max($widths[$cn][1], _max_width $c);
+            }
+            $cn++;
+        }
+    }
+
+    # calculate total min and max width
+    my ($total_min, $total_max) = (0,0);
+    for my $c (@widths) {
+        $total_min += $c->[0];
+        $total_max += $c->[1];
+    }
+    # extra space
+    my $extra_width += scalar grep {$_->[0] eq '|' or $_->[0] eq ' '}
+        (@{$self->{format}});
+    $total_min += $extra_width;
+    $total_max += $extra_width;
+
+    # if total_max <= screen width => use max as width
+    if($total_max <= $width) {
+        my $cn = 0;
+        for my $c (@widths) {
+            $self->{widths}[$cn]=$c->[1];
+            $cn++;
+        }
+        $self->{total_width} = $total_max;
+    }
+    else {
+        my @dist_width;
+        ITERATION: while(1) {
+            my $total_f = 0.0;
+            my $fixed_width = 0;
+            my $remaining=0;
+            for my $c (@widths) {
+                if(defined $c->[2]) {
+                    $fixed_width += $c->[2];
+                }
+                else {
+                    $total_f += _distribution_f($c->[1]);
+                    $remaining++;
+                }
+            }
+            my $available_width = $width-$extra_width-$fixed_width;
+            # enlarge width if it isn't enough
+            if($available_width < $remaining*5) {
+                $available_width = $remaining*5;
+                $width = $extra_width+$fixed_width+$available_width;
+            }
+            my $cn=-1;
+            COLUMN: for my $c (@widths) {
+                $cn++;
+                next COLUMN if defined $c->[2]; # skip fixed-widths
+                my $w = _distribution_f($c->[1]) * $available_width / $total_f;
+                if($c->[0] > $w) {
+                    $c->[2] = $c->[0];
+                    next ITERATION;
+                }
+                if($c->[1] < $w) {
+                    $c->[2] = $c->[1];
+                    next ITERATION;
+                }
+                $dist_width[$cn] = int($w);
+            }
+            last;
+        }
+        my $cn = 0;
+        for my $c (@widths) {
+            $self->{widths}[$cn]=defined $c->[2] ? $c->[2] : $dist_width[$cn];
+            $cn++;
+        }
+    }
+}
+
+sub _render_rule($$)
+{
+    my ($self, $char) = @_;
+    my $out = '';
+    my ($col,$data_col) = (0,0);
+    for my $c (@{$self->{format}}) {
+        if($c->[0] eq '|') {
+            if   ($char eq '-') { $out .= '+' }
+            elsif($char eq ' ') { $out .= '|' }
+            else                { $out .= $char }
+        }
+        elsif($c->[0] eq ' ') {
+            $out .= $char;
+        }
+        elsif( $c->[0] eq 'l' 
+            or $c->[0] eq 'L' 
+            or $c->[0] eq 'r' 
+            or $c->[0] eq 'R'
+            ) {
+            $out .= ($char)x($self->{widths}[$data_col]);
+            $data_col++;
+        }
+        $col++;
+    }
+    return $out."\n";
+}
+
+sub _render_data($$)
+{
+    my ($self,$data) = @_;
+
+    my @rdata; # rendered data
+
+    # render every column and find out number of lines
+    my ($col, $data_col) = (0,0);
+    my $lines=0;
+    my @rows_in_column;
+    for my $c (@{$self->{format}}) {
+        if( ($c->[0] eq 'l') or ($c->[0] eq 'L') ) {
+            my $lb = _l_box($self->{widths}[$data_col], $data->[$data_col]);
+            $rdata[$data_col] = $lb;
+            my $l = scalar @$lb ;
+            $lines = $l if $lines < $l;
+            $rows_in_column[$data_col] = $l;
+            $data_col++;
+        }
+        elsif( ($c->[0] eq 'r') or ($c->[0] eq 'R' ) ) {
+            my $rb = _r_box($self->{widths}[$data_col], $data->[$data_col]);
+            $rdata[$data_col] = $rb;
+            my $l = scalar @$rb ;
+            $lines = $l if $lines < $l;
+            $rows_in_column[$data_col] = $l ;
+            $data_col++;
+        }
+        $col++;
+    }
+
+    # render each line
+    my $out = '';
+    for my $l (0..($lines-1)) {
+        my ($col, $data_col) = (0,0);
+        for my $c (@{$self->{format}}) {
+            if($c->[0] eq '|') {
+                $out .= '|';
+            }
+            elsif($c->[0] eq ' ') {
+                $out .= ' ';
+            }
+            elsif( $c->[0] eq 'L' or $c->[0] eq 'R')
+            {
+                # bottom align
+                my $start_print = $lines - $rows_in_column[$data_col];
+                
+                if ( defined $rdata[$data_col][$l-$start_print] 
+                     and $l >= $start_print 
+                    )
+                {
+                    $out .= $rdata[$data_col][$l-$start_print];
+                }
+                else
+                {
+                    $out .= ' 'x($self->{widths}[$data_col]);
+                }
+                $data_col++;
+            }
+            elsif($c->[0] eq 'l' or $c->[0] eq 'r') {
+                # top align
+                if(defined $rdata[$data_col][$l]) {
+                    $out .= $rdata[$data_col][$l];
+                }
+                else {
+                    $out .= ' 'x($self->{widths}[$data_col]);
+                }
+                $data_col++;
+            }
+            $col++;
+        }
+        $out .= "\n";
+    }
+    return $out;
+}
+
+sub _parse_format($$)
+{
+    my ($self, $format) = @_;
+    my @f = split(//, $format);
+    my @format = ();
+    my @width  = ();
+    
+    my ($col,$data_col) = (0,0);
+    my $wid;
+    for my $f (@f) {
+        if ( $f =~ /(\d+)/)
+        {
+           $wid .= $f; 
+           next;
+        }
+        if($f eq 'l' or $f eq 'L' or $f eq 'r' or $f eq 'R') {
+            $format[$col] = [$f, $data_col];
+            $width[$data_col] = $wid; 
+            $wid = undef;
+            $data_col++;
+        }
+        elsif($f eq '|' or $f eq ' ') {
+            $format[$col] = [$f];
+        }
+        else {
+            croak "unknown column format: $f";
+        }
+        $col++;
+    }
+    $self->{format}=\@format;
+    $self->{fixed_widths}=\@width;
+    $self->{col}=$col;
+    $self->{data_col}=$data_col;
+}
+
+=item B<new>(I<$format>)
+
+Create a Text::FormatTable object, the format of each column is specified as a
+character of the $format string.
+
+=cut
+
+sub new($$)
+{
+    my ($class, $format) = @_;
+    croak "new() requires one argument: format" unless defined $format;
+    my $self = { col => '0', row => '0', data => [] };
+    bless $self, $class;
+    $self->_parse_format($format);
+    return $self;
+}
+
+# remove head and trail space
+sub _preprocess_row_data($$)
+{
+    my ($self,$data) = @_;
+    my $cn = 0;
+    for my $c (0..($#$data)) {
+        $data->[$c] =~ s/^\s+//m;
+        $data->[$c] =~ s/\s+$//m;
+    }
+}
+
+=item B<head>(I<$col1>, I<$col2>, ...)
+
+Add a header row using $col1, $col2, etc. as cell contents. Note that, at the
+moment, header rows are treated like normal rows.
+
+=cut
+
+sub head($@)
+{
+    my ($self, @data) = @_;
+    scalar @data == $self->{data_col} or
+        croak "number of columns must be $self->{data_col}";
+    $self->_preprocess_row_data(\@data);
+    $self->{data}[$self->{row}++] = ['head', \@data];
+}
+
+=item B<row>(I<$col1>, I<$col2>, ...)
+
+Add a row with $col1, $col2, etc. as cell contents.
+
+=cut
+
+sub row($@)
+{
+    my ($self, @data) = @_;
+    scalar @data == $self->{data_col} or
+        croak "number of columns must be $self->{data_col}";
+    # PZK 9/19/13: make sure all cols defined to avoid warnings
+    @data = map {defined $_ ? $_ : ""} @data;
+
+    $self->_preprocess_row_data(\@data);
+    $self->{data}[$self->{row}++] = ['data', \@data];
+}
+
+=item B<rule>([I<$char>])
+
+Add an horizontal rule. If $char is specified it will be used as character to
+draw the rule, otherwise '-' will be used.
+
+=cut
+
+sub rule($$)
+{
+    my ($self, $char) = @_;
+    $char = '-' unless defined $char;
+    $self->{data}[$self->{row}++] = ['rule', $char];
+}
+
+=item B<render>([I<$screen_width>])
+
+Return the rendered table formatted with $screen_width or 79 if it is not
+specified. 
+
+=cut
+
+sub render($$)
+{
+    my ($self, $width) = @_;
+    
+    $width = 79 unless defined $width;
+    $self->_calculate_widths($width);
+    
+    my $out = '';
+    for my $r (@{$self->{data}}) {
+        if($r->[0] eq 'rule') {
+            $out .= $self->_render_rule($r->[1]);
+        }
+        elsif($r->[0] eq 'head') {
+            $out .= $self->_render_data($r->[1]);
+        }
+        elsif($r->[0] eq 'data') {
+            $out .= $self->_render_data($r->[1]);
+        }
+    }
+    return $out;
+}
+
+1;
+
+
+########################
+#### Mail::Sendmail ####
+########################
+# Copyright (c) 2003 Milivoj Ivkovic
+# License: None Specified
+package Mail::Sendmail;
+
+require Exporter;
+use strict;
+use vars qw(
+            $VERSION
+            @ISA
+            @EXPORT
+            @EXPORT_OK
+            %mailcfg
+            $address_rx
+            $debug
+            $log
+            $error
+            $retry_delay
+            $connect_retries
+           );
+
+use Socket;
+use Time::Local; # for automatic time zone detection
+use Sys::Hostname; # for use of hostname in HELO
+
+@ISA        = qw(Exporter);
+@EXPORT     = qw(&sendmail);
+@EXPORT_OK  = qw(
+                 %mailcfg
+                 time_to_date
+                 $address_rx
+                 $debug
+                 $log
+                 $error
+                );
+
+# PZK 8/5/11 >
+# moved non-exported initialization into begin block
+$VERSION = '0.79';
+
+# *************** Configuration you may want to change *******************
+# You probably want to set your SMTP server here (unless you specify it in
+# every script), and leave the rest as is. See pod documentation for details
+
+%mailcfg = (
+    # List of SMTP servers:
+    'smtp'    => [ qw( localhost ) ],
+    #'smtp'    => [ qw( mail.mydomain.com ) ], # example
+
+    'from'    => '', # default sender e-mail, used when no From header in mail
+
+    'mime'    => 1, # use MIME encoding by default
+
+    'retries' => 1, # number of retries on smtp connect failure
+    'delay'   => 1, # delay in seconds between retries
+
+    'tz'      => '', # only to override automatic detection
+    'port'    => 25, # change it if you always use a non-standard port
+    'debug'   => 0 # prints stuff to STDERR
+);
+
+# *******************************************************************
+
+my ($word_rx, $user_rx, $dom_rx, $ip_rx, $address_rx);
+BEGIN {
+# use MIME::QuotedPrint if available and configured in %mailcfg
+eval("use MIME::QuotedPrint");
+$mailcfg{'mime'} &&= (!$@);
+
+# regex for e-mail addresses where full=$1, user=$2, domain=$3
+# see pod documentation about this regex
+
+$word_rx = '[\x21\x23-\x27\x2A-\x2B\x2D\x2F\w\x3D\x3F]+';
+$user_rx = $word_rx         # valid chars
+             .'(?:\.' . $word_rx . ')*' # possibly more words preceded by a dot
+             ;
+$dom_rx = '\w[-\w]*(?:\.\w[-\w]*)*'; # less valid chars in domain names
+$ip_rx = '\[\d{1,3}(?:\.\d{1,3}){3}\]';
+
+$address_rx = '((' . $user_rx . ')\@(' . $dom_rx . '|' . $ip_rx . '))';
+; # v. 0.61
+}
+# < PZK 8/5/11
+
+sub time_to_date {
+    # convert a time() value to a date-time string according to RFC 822
+
+    my $time = $_[0] || time(); # default to now if no argument
+
+    my @months = qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec);
+    my @wdays  = qw(Sun Mon Tue Wed Thu Fri Sat);
+
+    my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst)
+        = localtime($time);
+
+    my $TZ = $mailcfg{'tz'};
+    if ( $TZ eq "" ) {
+        # offset in hours
+        my $offset  = sprintf "%.1f", (timegm(localtime) - time) / 3600;
+        my $minutes = sprintf "%02d", abs( $offset - int($offset) ) * 60;
+        $TZ  = sprintf("%+03d", int($offset)) . $minutes;
+    }
+    return join(" ",
+                    ($wdays[$wday] . ','),
+                     $mday,
+                     $months[$mon],
+                     $year+1900,
+                     sprintf("%02d:%02d:%02d", $hour, $min, $sec),
+                     $TZ
+               );
+} # end sub time_to_date
+
+sub sendmail {
+
+    $error = '';
+    $log = "Mail::Sendmail v. $VERSION - "    . scalar(localtime()) . "\n";
+
+    my $CRLF = "\015\012";
+    local $/ = $CRLF;
+    local $\ = ''; # to protect us from outside settings
+    local $_;
+
+    my (%mail, $k,
+        $smtp, $server, $port, $connected, $localhost,
+        $fromaddr, $recip, @recipients, $to, $header,
+       );
+
+    # -------- a few internal subs ----------
+    sub fail {
+        # things to do before returning a sendmail failure
+        print STDERR @_ if $^W;
+        $error .= join(" ", @_) . "\n";
+        close S;
+        return 0;
+    }
+
+    sub socket_write {
+        my $i;
+        for $i (0..$#_) {
+            # accept references, so we don't copy potentially big data
+            my $data = ref($_[$i]) ? $_[$i] : \$_[$i];
+            if ($mailcfg{'debug'} > 5) {
+                if (length($$data) < 500) {
+                    print ">", $$data;
+                }
+                else {
+                    print "> [...", length($$data), " bytes sent ...]\n";
+                }
+            }
+            print(S $$data) || return 0;
+        }
+        1;
+    }
+
+    sub socket_read {
+        my $response; # for multi-line server responses
+        do {
+            chomp($_ = <S>);
+            print "<$_\n" if $mailcfg{'debug'} > 5;
+            if (/^[45]/ or !$_) {
+                return; # return false
+            }
+            $response .= $_;
+         } while (/^[\d]+-/);
+         return $response;
+    }
+    # -------- end of internal subs ----------
+
+    # all config keys to lowercase, to prevent typo errors
+    foreach $k (keys %mailcfg) {
+        if ($k =~ /[A-Z]/) {
+            $mailcfg{lc($k)} = $mailcfg{$k};
+        }
+    }
+
+    # redo mail hash, arranging keys case etc...
+    while (@_) {
+        $k = shift @_;
+        if (!$k and $^W) {
+            warn "Received false mail hash key: \'$k\'. Did you forget to put it in quotes?\n";
+        }
+
+        # arrange keys case
+        $k = ucfirst lc($k);
+
+        $k =~ s/\s*:\s*$//o; # kill colon (and possible spaces) at end, we add it later.
+        # uppercase also after "-", so people don't complain that headers case is different
+        # than in Outlook.
+        $k =~ s/-(.)/"-" . uc($1)/ge;
+        $mail{$k} = shift @_;
+    }
+
+    $smtp = $mail{'Smtp'} || $mail{'Server'};
+    unshift @{$mailcfg{'smtp'}}, $smtp if ($smtp and $mailcfg{'smtp'}->[0] ne $smtp);
+
+    # delete non-header keys, so we don't send them later as mail headers
+    # I like this syntax, but it doesn't seem to work with AS port 5.003_07:
+    # delete @mail{'Smtp', 'Server'};
+    # so instead:
+    delete $mail{'Smtp'}; delete $mail{'Server'};
+
+    $mailcfg{'port'} = $mail{'Port'} || $mailcfg{'port'} || 25;
+    delete $mail{'Port'};
+
+    {    # don't warn for undefined values below
+        local $^W = 0;
+        $mail{'Message'} = join("", $mail{'Message'}, $mail{'Body'}, $mail{'Text'});
+    }
+
+    # delete @mail{'Body', 'Text'};
+    delete $mail{'Body'}; delete $mail{'Text'};
+
+    # Extract 'From:' e-mail address to use as envelope sender
+
+    $fromaddr = $mail{'Sender'} || $mail{'From'} || $mailcfg{'from'};
+    delete $mail{'Sender'};
+    unless ($fromaddr =~ /$address_rx/) {
+        return fail("Bad or missing From address: \'$fromaddr\'");
+    }
+    $fromaddr = $1;
+
+    # add Date header if needed
+    $mail{Date} ||= time_to_date() ;
+    $log .= "Date: $mail{Date}\n";
+
+    # cleanup message, and encode if needed
+    $mail{'Message'} =~ s/\r\n/\n/go;     # normalize line endings, step 1 of 2 (next step after MIME encoding)
+
+    $mail{'Mime-Version'} ||= '1.0';
+    $mail{'Content-Type'} ||= 'text/plain; charset="iso-8859-1"';
+
+    unless ( $mail{'Content-Transfer-Encoding'}
+          || $mail{'Content-Type'} =~ /multipart/io )
+    {
+        if ($mailcfg{'mime'}) {
+            $mail{'Content-Transfer-Encoding'} = 'quoted-printable';
+            $mail{'Message'} = encode_qp($mail{'Message'});
+        }
+        else {
+            $mail{'Content-Transfer-Encoding'} = '8bit';
+            if ($mail{'Message'} =~ /[\x80-\xFF]/o) {
+                $error .= "MIME::QuotedPrint not present!\nSending 8bit characters, hoping it will come across OK.\n";
+                warn "MIME::QuotedPrint not present!\n",
+                     "Sending 8bit characters without encoding, hoping it will come across OK.\n"
+                     if $^W;
+            }
+        }
+    }
+
+    $mail{'Message'} =~ s/^\./\.\./gom;     # handle . as first character
+    $mail{'Message'} =~ s/\n/$CRLF/go; # normalize line endings, step 2.
+
+    # Get recipients
+    {    # don't warn for undefined values below
+        local $^W = 0;
+        $recip = join(", ", $mail{To}, $mail{Cc}, $mail{Bcc});
+    }
+
+    delete $mail{'Bcc'};
+
+    @recipients = ();
+    while ($recip =~ /$address_rx/go) {
+        push @recipients, $1;
+    }
+    unless (@recipients) {
+        return fail("No recipient!")
+    }
+
+    # get local hostname for polite HELO
+    $localhost = hostname() || 'localhost';
+
+    foreach $server ( @{$mailcfg{'smtp'}} ) {
+        # open socket needs to be inside this foreach loop on Linux,
+        # otherwise all servers fail if 1st one fails !??! why?
+        unless ( socket S, AF_INET, SOCK_STREAM, scalar(getprotobyname 'tcp') ) {
+            return fail("socket failed ($!)")
+        }
+
+        print "- trying $server\n" if $mailcfg{'debug'} > 1;
+
+        $server =~ s/\s+//go; # remove spaces just in case of a typo
+        # extract port if server name like "mail.domain.com:2525"
+        $port = ($server =~ s/:(\d+)$//o) ? $1 : $mailcfg{'port'};
+        $smtp = $server; # save $server for use outside foreach loop
+
+        my $smtpaddr = inet_aton $server;
+        unless ($smtpaddr) {
+            $error .= "$server not found\n";
+            next; # next server
+        }
+
+        my $retried = 0; # reset retries for each server
+        while ( ( not $connected = connect S, pack_sockaddr_in($port, $smtpaddr) )
+            and ( $retried < $mailcfg{'retries'} )
+              ) {
+            $retried++;
+            $error .= "connect to $server failed ($!)\n";
+            print "- connect to $server failed ($!)\n" if $mailcfg{'debug'} > 1;
+            print "retrying in $mailcfg{'delay'} seconds...\n" if $mailcfg{'debug'} > 1;
+            sleep $mailcfg{'delay'};
+        }
+
+        if ( $connected ) {
+            print "- connected to $server\n" if $mailcfg{'debug'} > 3;
+            last;
+        }
+        else {
+            $error .= "connect to $server failed\n";
+            print "- connect to $server failed, next server...\n" if $mailcfg{'debug'} > 1;
+            next; # next server
+        }
+    }
+
+    unless ( $connected ) {
+        return fail("connect to $smtp failed ($!) no (more) retries!")
+    };
+
+    {
+        local $^W = 0; # don't warn on undefined variables
+        # Add info to log variable
+        $log .= "Server: $smtp Port: $port\n"
+              . "From: $fromaddr\n"
+              . "Subject: $mail{Subject}\n"
+              . "To: ";
+    }
+
+    my($oldfh) = select(S); $| = 1; select($oldfh);
+
+    socket_read()
+        || return fail("Connection error from $smtp on port $port ($_)");
+    socket_write("HELO $localhost$CRLF")
+        || return fail("send HELO error");
+    socket_read()
+        || return fail("HELO error ($_)");
+    socket_write("MAIL FROM: <$fromaddr>$CRLF")
+        || return fail("send MAIL FROM: error");
+    socket_read()
+        || return fail("MAIL FROM: error ($_)");
+
+    foreach $to (@recipients) {
+        socket_write("RCPT TO: <$to>$CRLF")
+            || return fail("send RCPT TO: error");
+        socket_read()
+            || return fail("RCPT TO: error ($_)");
+        $log .= "$to\n    ";
+    }
+
+    # start data part
+
+    socket_write("DATA$CRLF")
+        || return fail("send DATA error");
+    socket_read()
+        || return fail("DATA error ($_)");
+
+    # print headers
+    foreach $header (keys %mail) {
+        next if $header eq "Message";
+        $mail{$header} =~ s/\s+$//o; # kill possible trailing garbage
+        socket_write("$header: $mail{$header}$CRLF")
+            || return fail("send $header: error");
+    };
+
+    #- test diconnecting from network here, to see what happens
+    #- print STDERR "DISCONNECT NOW!\n";
+    #- sleep 4;
+    #- print STDERR "trying to continue, expecting an error... \n";
+
+    # send message body (passed as a reference, in case it's big)
+    socket_write($CRLF, \$mail{'Message'}, "$CRLF.$CRLF")
+           || return fail("send message error");
+    socket_read()
+        || return fail("message transmission error ($_)");
+    $log .= "\nResult: $_";
+
+    # finish
+    socket_write("QUIT$CRLF")
+           || return fail("send QUIT error");
+    socket_read();
+    close S;
+
+    return 1;
+} # end sub sendmail
+
+1;
+

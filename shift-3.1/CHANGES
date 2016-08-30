@@ -1,0 +1,12 @@
+CHANGES
+=======
+
+* Shift 3.0 (01/09/14)
+    - First public release
+    - Note that --no-offline is currently enabled by default due to
+        DMF corruption issues found when releasing files immediately
+        after they are copied.
+
+* Shift 3.1 (01/13/14)
+    - Removed some site-specific config that was mistakenly included in shiftc.
+    - Fixed bad metadata counts during --sync preventing dirs from completing
